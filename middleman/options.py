@@ -62,7 +62,7 @@ class Options:
         group_log.add_argument('--log_file_max_bytes', type=int,
                                default=4 * 1024 * 1024,
                                help=("max bytes of log files before rollover "
-                                     "%(default)s"))
+                                   "(default: %(default)s)"))
         group_log.add_argument('--log_file_backup_count', type=int, default=10,
                                help=('number of log files to keep '
                                      '(default: %(default)s)'))
