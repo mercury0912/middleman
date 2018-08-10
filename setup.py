@@ -20,14 +20,28 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import os
+import re
+
 from setuptools import setup, find_packages
+
 
 with open("README.rst") as f:
     long_description = f.read()
 
+here = os.path.abspath(os.path.dirname(__file__))
+with open(os.path.join(here, "middleman", "__init__.py")) as version_file:
+    pattern = r"__version__\s*=\s*(['\"])([^'\"]*)\1"
+    match = re.search(pattern, version_file.read(), re.MULTILINE)
+    if match:
+        version = match.group(2)
+    else:
+        raise RuntimeError("Unable to find __version__ string.")
+
+
 setup(
-    name="mmiddleman",
-    version="0.0.1",
+    name="middleman",
+    version=version,
     packages=find_packages(),
     include_package_data=True,
     description=("middleman is a package which provides a chance to know more"
@@ -55,6 +69,6 @@ setup(
     python_requires=">=3.4",
     zip_safe=False,
     entry_points={
-        'console_scripts' : ['middleman = middleman.server:main']
+        'console_scripts': ['middleman = middleman.server:main']
     }
 )
