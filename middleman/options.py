@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import sys
 
 from middleman import __version__
 from middleman.log import Log
@@ -91,8 +92,11 @@ class Options:
                     "Type mismatch: %r required, but %s given" %
                     (dict.__name__, type(cfg).__name__))
         except ValueError as exc:
-            raise ValueError("%s: %s" %
-                             (os.path.abspath(config_file.name), exc))
+            if config_file is sys.stdin:
+                path = config_file.name
+            else:
+                path = os.path.abspath(config_file.name)
+            raise ValueError("%s: %s" % (path, exc))
         finally:
             config_file.close()
         return cfg
@@ -104,7 +108,11 @@ class Options:
             if not attr.startswith('_'):
                 val = getattr(Options.options, attr)
                 if attr == 'config_file':
-                    val = val if val is None else os.path.abspath(val.name)
+                    if val is not None:
+                        if val is sys.stdin:
+                            val = val.name
+                        else:
+                            val = os.path.abspath(val.name)
                 elif attr == 'log_file_prefix':
                     val = val if val is None else os.path.abspath(val)
                 print("%-30s %s" % (attr, val))
