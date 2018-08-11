@@ -20,18 +20,26 @@ class Options:
             Options.options = args
 
     @staticmethod
-    def _merge_options(command_line_options, config_options):
+    def _check_config_file(opt, val, cmd_opts):
+        if opt not in cmd_opts:
+            raise KeyError("Invalid option: %r" % opt)
+        cmd_val = getattr(cmd_opts, opt)
+        if opt == "log_file_prefix":
+            if val is not None and not isinstance(val, str):
+                raise TypeError(
+                    "Option %r is required to be a %s(or %s) (%s given)" %
+                    (opt, str.__name__, None, type(val).__name__))
+        elif cmd_val is not None and not isinstance(val, type(cmd_val)):
+            raise TypeError(
+                "Option %r is required to be a %s (%s given)" %
+                (opt, type(cmd_val).__name__, type(val).__name__))
+
+    @staticmethod
+    def _merge_options(cmd_line_options, config_options):
         for opt, value in config_options.items():
-            if opt in command_line_options:
-                val = getattr(command_line_options, opt)
-                if val is not None and not isinstance(value, type(val)):
-                    raise TypeError(
-                        "Option %r is required to be a %s (%s given)" %
-                        (opt, type(val).__name__, type(value).__name__))
-                setattr(command_line_options, opt, value)
-            else:
-                raise KeyError("Invalid option: %r" % opt)
-        return command_line_options
+            Options._check_config_file(opt, value, cmd_line_options)
+            setattr(cmd_line_options, opt, value)
+        return cmd_line_options
 
     @staticmethod
     def _parse_command_line():
@@ -63,7 +71,7 @@ class Options:
         group_log.add_argument('--log_file_max_bytes', type=int,
                                default=4 * 1024 * 1024,
                                help=("max bytes of log files before rollover "
-                                   "(default: %(default)s)"))
+                                     "(default: %(default)s)"))
         group_log.add_argument('--log_file_backup_count', type=int, default=10,
                                help=('number of log files to keep '
                                      '(default: %(default)s)'))
@@ -84,7 +92,6 @@ class Options:
     def _parse_config_file(config_file):
         if config_file is None:
             return None
-
         try:
             cfg = json.load(config_file)
             if not isinstance(cfg, dict):
@@ -92,10 +99,7 @@ class Options:
                     "Type mismatch: %r required, but %s given" %
                     (dict.__name__, type(cfg).__name__))
         except ValueError as exc:
-            if config_file is sys.stdin:
-                path = config_file.name
-            else:
-                path = os.path.abspath(config_file.name)
+            path = Options.file_path(config_file)
             raise ValueError("%s: %s" % (path, exc))
         finally:
             config_file.close()
@@ -107,13 +111,19 @@ class Options:
         for attr in dir(Options.options):
             if not attr.startswith('_'):
                 val = getattr(Options.options, attr)
-                if attr == 'config_file':
-                    if val is not None:
-                        if val is sys.stdin:
-                            val = val.name
-                        else:
-                            val = os.path.abspath(val.name)
-                elif attr == 'log_file_prefix':
-                    val = val if val is None else os.path.abspath(val)
+                if attr == 'config_file' or attr == 'log_file_prefix':
+                    val = Options.file_path(val)
                 print("%-30s %s" % (attr, val))
         print('=' * 80, flush=True)
+
+    @staticmethod
+    def file_path(file):
+        if file is not None:
+            if file is sys.stdin:
+                path = file.name
+            else:
+                name = file if isinstance(file, str) else file.name
+                path = os.path.abspath(name)
+            return path
+        else:
+            return None
