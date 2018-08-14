@@ -22,8 +22,8 @@ class Log:
         if logger is None:
             logger = logging.getLogger()
         if options.logging not in self.LOGGING_LEVEL:
-            err_msg = Log.get_error_message('logging', options.logging,
-                                            self.LOGGING_LEVEL)
+            err_msg = Log._get_error_message('logging', options.logging,
+                                             self.LOGGING_LEVEL)
             raise ValueError(err_msg)
         logger.setLevel(getattr(logging, options.logging.upper()))
         formatter = logging.Formatter(fmt=self._fmt, datefmt=self._datefmt)
@@ -34,13 +34,13 @@ class Log:
                     backupCount=options.log_file_backup_count)
                 ch.setFormatter(formatter)
                 logger.addHandler(ch)
-        if options.log_both or not logger.hasHandlers():
+        if options.log_both:
             ch = logging.StreamHandler()
             ch.setFormatter(formatter)
             logger.addHandler(ch)
 
     @staticmethod
-    def get_error_message(opt, val, choices):
+    def _get_error_message(opt, val, choices):
         error_message = ", ".join(map(lambda choice: "%r" % choice, choices))
         error_message = ("Option %s: invalid choice: %r "
                          "(choose from %s)" % (opt, val, error_message))
