@@ -4,21 +4,24 @@ __all__ = ['options', 'display_options_info', 'parse_options']
 import argparse
 import json
 import os
+import sys
 
 
 from middleman import __version__
 from middleman.log import Log
 
 
-def display_options_info():
-    if options is None:
+def display_options_info(opts):
+    if opts is None:
         return
     print('=' * 80)
-    for attr in vars(options):
-        val = getattr(options, attr)
+    for attr in sorted(vars(opts)):
+        val = getattr(opts, attr)
         if attr == 'config_file' or attr == 'log_file_prefix':
             if val is not None:
                 val = os.path.abspath(val)
+        if attr == 'V':
+            continue
         print("%-30s %s" % (attr, val))
     print('=' * 80, flush=True)
 
@@ -28,6 +31,9 @@ def parse_options():
     if opts.config_file is not None:
         config = _parse_config_file(opts.config_file)
         opts = _merge_options(opts, config)
+    if hasattr(opts, 'V'):
+        display_options_info(opts)
+        sys.exit(0)
     return opts
 
 
@@ -47,23 +53,26 @@ def _parse_command_line():
                            choices=Log.LOGGING_LEVEL,
                            dest='logging',
                            help='set log level (default: %(default)s)')
-    group_log.add_argument('--log_both', action='store_true',
-                           help=("send log to stderr and file if "
-                                 "log_file_prefix is also set "
+    group_log.add_argument('-B', '--log_both', action='store_true',
+                           dest="log_both",
+                           help=("send log to stderr and file "
                                  "(default: %(default)s)"))
-    group_log.add_argument('--log_file_prefix', metavar='PATH',
+    group_log.add_argument('-P', metavar='log_file_prefix',
+                           dest="log_file_prefix",
                            default=os.path.abspath('middlemanlog'),
                            help=('path prefix for log files. '
                                  'Note that if you are running multiple '
                                  'middleman processes, log_file_prefix '
                                  'must be different for each of them (e.g.'
-                                 ' include the port number)'
+                                 ' include the port number) '
                                  '(default: %(default)s)'))
-    group_log.add_argument('--log_file_max_bytes', type=int,
+    group_log.add_argument('-M', metavar='log_file_max_bytes',
+                           dest='log_file_max_bytes', type=int,
                            default=4 * 1024 * 1024,
                            help=("max bytes of log files before rollover "
                                  "(default: %(default)s)"))
-    group_log.add_argument('--log_file_backup_count', type=int, default=10,
+    group_log.add_argument('-C', metavar='log_file_backup_count',
+                           dest='log_file_backup_count', type=int, default=10,
                            help=('number of log files to keep '
                                  '(default: %(default)s)'))
 
@@ -72,9 +81,15 @@ def _parse_command_line():
                             version='%(prog)s ' + __version__)
     group_misc.add_argument('-h', '--help', action='help',
                             help='show this help text and exit')
+    group_misc.add_argument('-V', action='store_true', default=argparse.SUPPRESS,
+                            help='show configure options then exit')
 
-    parser.add_argument('-f', dest='config_file', metavar='config-file',
-                        help='use given config-file')
+    group_gen = parser.add_argument_group('General options')
+    group_gen.add_argument('-c', metavar='config_file', dest='config_file',
+                           help='set configuration file')
+    group_gen.add_argument('--pid-file', metavar='pid_file', dest='pid_file',
+                           default='/var/run/middleman.pid',
+                           help="""set pid file (default: %(default)s)""")
     args = parser.parse_args()
     return args
 
