@@ -1,6 +1,7 @@
 import logging
 import logging.handlers
 
+
 # Logger objects for internal tornado use
 access_log = logging.getLogger("middle.access")
 gen_log = logging.getLogger("middle.general")
@@ -21,10 +22,6 @@ class Log:
             return
         if logger is None:
             logger = logging.getLogger()
-        if options.logging not in self.LOGGING_LEVEL:
-            err_msg = Log._get_error_message('logging', options.logging,
-                                             self.LOGGING_LEVEL)
-            raise ValueError(err_msg)
         logger.setLevel(getattr(logging, options.logging.upper()))
         formatter = logging.Formatter(fmt=self._fmt, datefmt=self._datefmt)
         if options.log_file_prefix:
@@ -38,10 +35,3 @@ class Log:
             ch = logging.StreamHandler()
             ch.setFormatter(formatter)
             logger.addHandler(ch)
-
-    @staticmethod
-    def _get_error_message(opt, val, choices):
-        error_message = ", ".join(map(lambda choice: "%r" % choice, choices))
-        error_message = ("Option %s: invalid choice: %r "
-                         "(choose from %s)" % (opt, val, error_message))
-        return error_message

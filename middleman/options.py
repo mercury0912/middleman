@@ -1,4 +1,8 @@
-__all__ = ['options', 'display_options_info', 'parse_options']
+__all__ = ['options',
+           'display_options_info',
+           'parse_options',
+           'get_error_message',
+           ]
 
 
 import argparse
@@ -9,32 +13,50 @@ import sys
 
 from middleman import __version__
 from middleman.log import Log
+from middleman.util import exit_prog
+from middleman.platform.auto import DAEMON_RUNNING
+
+_opt_choices_map = {'logging': Log.LOGGING_LEVEL, 'daemon': DAEMON_RUNNING}
+_opt_files = ['config_file', 'log_file_prefix', 'pid_file']
 
 
 def display_options_info(opts):
     if opts is None:
         return
+    print()
     print('=' * 80)
     for attr in sorted(vars(opts)):
         val = getattr(opts, attr)
-        if attr == 'config_file' or attr == 'log_file_prefix':
-            if val is not None:
-                val = os.path.abspath(val)
         if attr == 'V':
             continue
         print("%-30s %s" % (attr, val))
-    print('=' * 80, flush=True)
+    print('=' * 80)
+    print(flush=True)
 
 
 def parse_options():
-    opts = _parse_command_line()
-    if opts.config_file is not None:
-        config = _parse_config_file(opts.config_file)
-        opts = _merge_options(opts, config)
-    if hasattr(opts, 'V'):
-        display_options_info(opts)
-        sys.exit(0)
-    return opts
+    try:
+        opts = _parse_command_line()
+        if opts.config_file is not None:
+            config = _parse_config_file(opts.config_file)
+            opts = _merge_options(opts, config)
+        set_abspath(opts, _opt_files)
+        if hasattr(opts, 'V'):
+            display_options_info(opts)
+            sys.exit(0)
+        else:
+            return opts
+    except Exception as exc:
+        exit_prog(1, "%s" % exc)
+
+
+def set_abspath(opts, opt_files):
+    for name in opt_files:
+        if name in opts:
+            path = getattr(opts, name)
+            if path is not None:
+                abspath = os.path.abspath(path)
+                setattr(opts, name, abspath)
 
 
 def _parse_command_line():
@@ -60,7 +82,7 @@ def _parse_command_line():
     group_log.add_argument('-P', metavar='log_file_prefix',
                            dest="log_file_prefix",
                            default=os.path.abspath('middlemanlog'),
-                           help=('path prefix for log files. '
+                           help=('specify log file name prefix. '
                                  'Note that if you are running multiple '
                                  'middleman processes, log_file_prefix '
                                  'must be different for each of them (e.g.'
@@ -82,14 +104,18 @@ def _parse_command_line():
     group_misc.add_argument('-h', '--help', action='help',
                             help='show this help text and exit')
     group_misc.add_argument('-V', action='store_true', default=argparse.SUPPRESS,
-                            help='show configure options then exit')
+                            help='show configure options and exit')
 
     group_gen = parser.add_argument_group('General options')
     group_gen.add_argument('-c', metavar='config_file', dest='config_file',
                            help='set configuration file')
-    group_gen.add_argument('--pid-file', metavar='pid_file', dest='pid_file',
+    group_gen.add_argument('-d', default='off', choices=DAEMON_RUNNING,
+                           dest='daemon',
+                           help='become a daemon process '
+                                '(Unix-like only default: %(default)s)')
+    group_gen.add_argument('-f', metavar='pid_file', dest='pid_file',
                            default='/var/run/middleman.pid',
-                           help="""set pid file (default: %(default)s)""")
+                           help='set pid file (default: %(default)s)')
     args = parser.parse_args()
     return args
 
@@ -127,6 +153,21 @@ def _check_config_file(opt, val, cmd_opts):
         raise TypeError(
             "Option %r is required to be a %s (%s given)" %
             (opt, type(cmd_val).__name__, type(val).__name__))
+    _check_choices(opt, val)
+
+
+def _check_choices(opt, val):
+    if opt in _opt_choices_map:
+        if val not in _opt_choices_map[opt]:
+            err_msg = get_error_message(opt, val, _opt_choices_map[opt])
+            raise ValueError(err_msg)
+
+
+def get_error_message(opt, val, choices):
+    error_message = ", ".join(map(lambda choice: "%r" % choice, choices))
+    error_message = ("Option %s: invalid choice: %r "
+                     "(choose from %s)" % (opt, val, error_message))
+    return error_message
 
 
 options = parse_options()
