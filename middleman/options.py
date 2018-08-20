@@ -109,13 +109,14 @@ def _parse_command_line():
     group_gen = parser.add_argument_group('General options')
     group_gen.add_argument('-c', metavar='config_file', dest='config_file',
                            help='set configuration file')
-    group_gen.add_argument('-d', default='off', choices=DAEMON_RUNNING,
-                           dest='daemon',
-                           help='become a daemon process '
-                                '(Unix-like only default: %(default)s)')
-    group_gen.add_argument('-f', metavar='pid_file', dest='pid_file',
-                           default='/var/run/middleman.pid',
-                           help='set pid file (default: %(default)s)')
+    if os.name != 'nt':
+        group_gen.add_argument(
+            '-d', default='off', choices=DAEMON_RUNNING,
+            dest='daemon', help='become a daemon process default: %(default)s)')
+        group_gen.add_argument(
+            '-f', metavar='pid_file', dest='pid_file',
+            default='/var/run/middleman.pid',
+            help='set pid file (default: %(default)s)')
     args = parser.parse_args()
     return args
 
