@@ -64,11 +64,18 @@ def _parse_command_line():
         description="I'm just a middleman.", add_help=False,
         usage="%(prog)s [OPTION]...",
         epilog="Online help: https://github.com/mercury0912/middleman")
-    group_proxy = parser.add_argument_group('Proxy options')
+    group_proxy = parser.add_argument_group('Service-level options')
     group_proxy.add_argument(
-        '-p', action='store', dest='port',
-        type=int, default=8255, metavar='port',
-        help='specify server port number (default: %(default)s)')
+        'hostname', nargs='?', default='127.0.0.1',
+        help='IP address or hostname (default: %(default)s)')
+    group_proxy.add_argument(
+        '-p', dest='port', type=int, default=1080, metavar='port',
+        help='tcp por number (default: %(default)s)')
+    group_proxy.add_argument('-c', dest='client', action='store_false',
+                             help='run as the client (default: %(default)s)')
+    group_proxy.add_argument('-t', dest='timeout', type=int,
+                             default=300, metavar='timeout',
+                             help='timeout in seconds for idle connections (default: %(default)ss)')
 
     group_log = parser.add_argument_group('Logging control')
     group_log.add_argument('--logging', default='warning',
@@ -83,10 +90,6 @@ def _parse_command_line():
                            dest="log_file_prefix",
                            default=os.path.abspath('middlemanlog'),
                            help=('specify log file name prefix. '
-                                 'Note that if you are running multiple '
-                                 'middleman processes, log_file_prefix '
-                                 'must be different for each of them (e.g.'
-                                 ' include the port number) '
                                  '(default: %(default)s)'))
     group_log.add_argument('-M', metavar='log_file_max_bytes',
                            dest='log_file_max_bytes', type=int,
@@ -107,12 +110,12 @@ def _parse_command_line():
                             help='show configure options and exit')
 
     group_gen = parser.add_argument_group('General options')
-    group_gen.add_argument('-c', metavar='config_file', dest='config_file',
-                           help='set configuration file')
+    group_gen.add_argument('-f', metavar='config_file', dest='config_file',
+                           help='specify configuration file')
     if os.name != 'nt':
         group_gen.add_argument(
             '-d', default='off', choices=DAEMON_RUNNING,
-            dest='daemon', help='become a daemon process default: %(default)s)')
+            dest='daemon', help='daemon mode default: %(default)s)')
         group_gen.add_argument(
             '-f', metavar='pid_file', dest='pid_file',
             default='/var/run/middleman.pid',

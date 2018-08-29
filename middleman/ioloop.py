@@ -1,10 +1,21 @@
+import collections
 import errno
+import functools
+import heapq
+import itertools
+import math
+import numbers
 import os
-from selectors import DefaultSelector, EVENT_READ, EVENT_WRITE
+import random
+import selectors
 import threading
 import time
 
+from concurrent.futures import ThreadPoolExecutor
+
+from middleman import util
 from middleman.log import gen_log
+from middleman.platform.auto import set_close_exec, Waker
 
 
 _POLL_TIMEOUT = 3600.0
@@ -20,8 +31,8 @@ class IOLoop:
     either ``epoll`` or ``kqueue``.
     """
     # Our events map exactly to the selectors events
-    READ = EVENT_READ
-    WRITE = EVENT_WRITE
+    READ = selectors.EVENT_READ
+    WRITE = selectors.EVENT_WRITE
 
     # Global lock for creating global IOLoop instance
     _instance_lock = threading.Lock()
@@ -30,7 +41,7 @@ class IOLoop:
 
     def __init__(self,
                  make_current=None,
-                 impl=DefaultSelector(),
+                 impl=selectors.DefaultSelector(),
                  time_func=None):
 
         if make_current is None:
@@ -42,11 +53,41 @@ class IOLoop:
             self.make_current()
 
         self._impl = impl
+        if hasattr(self._impl, 'fileno'):
+            set_close_exec(self._impl.fileno())
+        self._events = {}
+        self._callbacks = collections.deque()
+        self._timeouts = []
+        self._cancellations = 0
         self.time_func = time_func or time.time
         self._stopped = False
         self._running = False
         self._closing = False
         self._thread_ident = None
+        # unique sequence count
+        self._timeout_counter = itertools.count()
+
+        # Create a pipe that we send bogus data to when we want to wake
+        # the I/O loop when it is idle
+        self._waker = Waker()
+        self.add_handler(self._waker.fileno(),
+                         self.READ,
+                         lambda fd, events: self._waker.consume())
+
+    def close(self, all_fds=False):
+        self._closing = True
+        self.remove_handler(self._waker.fileno())
+
+        if all_fds:
+            for fd in self._impl.get_map():
+                self.close_fd(fd)
+        self._impl.close()
+        self._waker.close()
+        self._impl.close()
+        self._callbacks = None
+        self._timeouts = None
+        if hasattr(self, '_executor'):
+            self._executor.shutdown()
 
     @staticmethod
     def instance():
@@ -146,14 +187,7 @@ class IOLoop:
     def handle_callback_exception(callback):
         gen_log.error("Exception in callback %r", callback, exc_info=True)
 
-    def close(self, all_fds=False):
-        self._closing = True
-        if all_fds:
-            for fd in self._impl.get_map():
-                self.close_fd(fd)
-        self._impl.close()
-
-    def add_handler(self, fileobj, handler, events):
+    def add_handler(self, fileobj, events, handler):
         try:
             self._impl.register(fileobj, events, handler)
         except (ValueError, KeyError):
@@ -161,15 +195,27 @@ class IOLoop:
 
     def update_handler(self, fileobj, events, handler=None):
         try:
-            self._impl.modify(fileobj, events, handler)
+            if handler is not None:
+                self._impl.modify(fileobj, events, handler)
+            else:
+                key = self._impl.get_key(fileobj)
+                self._impl.modify(fileobj, events, key.data)
         except (ValueError, KeyError):
             gen_log.exception("Error updating fileobj to IOLoop")
 
     def remove_handler(self, fileobj):
         try:
+            fd = util.fileobj_to_fd(fileobj)
+            self._events.pop(fd, None)
             self._impl.unregister(fileobj)
         except (ValueError, KeyError):
             gen_log.exception("Error deleting fileobj from IOLoop")
+
+    def get_key(self, fileobj):
+        try:
+            return self._impl.get_key(fileobj)
+        except KeyError:
+            gen_log.exception("Error getting key from IOLoop")
 
     def start(self):
         if self._running:
@@ -181,10 +227,62 @@ class IOLoop:
         IOLoop._current.instance = self
         self._thread_ident = threading.get_ident()
         self._running = True
+        self._timeout_counter = itertools.count()
 
         try:
             while True:
-                poll_timeout = _POLL_TIMEOUT
+                # Prevent IO event starvation by delaying new callbacks
+                # to the next iteration of the event loop.
+                ncallbacks = len(self._callbacks)
+
+                # Add any timeouts that have come due to the callback list.
+                # Do not run anything until we have determined which ones
+                # are ready, so timeouts that call add_timeout cannot
+                # schedule anything in this iteration.
+                due_timeouts = []
+                if self._timeouts:
+                    now = self.time()
+                    while self._timeouts:
+                        if self._timeouts[0].callback is None:
+                            # The timeout was cancelled. Note that the
+                            # cancellation check is repeated below for timeouts
+                            # that are cancelled by another timeout or callback.
+                            heapq.heappop(self._timeouts)
+                            self._cancellations -= 1
+                        elif self._timeouts[0].deadline <= now:
+                            due_timeouts.append(heapq.heappop(self._timeouts))
+                        else:
+                            break
+                    if (self._cancellations > 512 and
+                            self._cancellations > (len(self._timeouts) >> 1)):
+                        # Clean upt the timeout queue when it gets large and
+                        # it's more than half queue length
+                        self._cancellations = 0
+                        self._timeouts = [x for x in self._timeouts
+                                          if x.callback is not None]
+                        heapq.heapify(self._timeouts)
+
+                for i in range(ncallbacks):
+                    self._run_callback(self._callbacks.popleft())
+                for timeout in due_timeouts:
+                    if timeout.callback is not None:
+                        self._run_callback(timeout.callback)
+                # Closures may be holding on to a lot of memory, so allow
+                # them to be freed before we go into our poll wait.
+                due_timeouts = timeout = None
+
+                if self._callbacks:
+                    # If any callbacks or timeouts called add_callback,
+                    # we don't want to wait in poll() before we run them.
+                    poll_timeout = 0.0
+                elif self._timeouts:
+                    # if there are any timeouts, schedule the first one.
+                    # Use self.time() instead of 'now' to account for time
+                    # spent running callbacks.
+                    poll_timeout = self._timeouts[0].deadline - self.time()
+                    poll_timeout = max(0, min(poll_timeout, _POLL_TIMEOUT))
+                else:
+                    poll_timeout = _POLL_TIMEOUT
 
                 if not self._running:
                     break
@@ -196,18 +294,28 @@ class IOLoop:
                         continue
                     else:
                         raise
-                for key, mask in events:
+
+                # Pop one fd at a time from the set of pending fds and run
+                # its handler. Since that handler may perform actions on
+                # other file descriptors, there may be reentrant calls to
+                # this IOLoop that modify self._events
+                event_pairs = {key.fd: (key, mask) for key, mask in events}
+                self._events.update(event_pairs)
+                while self._events:
+                    fd, key_mask = self._events.popitem()
                     try:
-                        handler_func = key.data
-                        handler_func(key.fileobj, mask)
+                        handler_func = key_mask[0].data
+                        handler_func(key_mask[0].fileobj, key_mask[1])
                     except OSError as exc:
                         if exc.errno == errno.EPIPE:
                             # Happens when the client closes the connection
                             pass
                         else:
-                            self.handle_callback_exception(key)
+                            self.handle_callback_exception(key_mask)
                     except Exception:
-                        self.handle_callback_exception(key)
+                        self.handle_callback_exception(key_mask)
+                # Release resources held by us
+                key_mask = handler_func = None
         finally:
             self._stopped = False
             IOLoop._current.instance = old_current
@@ -215,3 +323,211 @@ class IOLoop:
     def stop(self):
         self._running = False
         self._stopped = True
+        self._waker.wake()
+
+    def add_timeout(self, deadline, callback, *args, **kwargs):
+        """Runs the ``callback`` at the time ``deadline`` from the I/O loop.
+
+        Returns an opaque handle that may be passed to
+        `remove_timeout` to cancel.
+
+        ``deadline`` may be a number denoting a time (on the same
+        scale as `IOLoop.time`, normally `time.time`)
+
+        Note that it is not safe to call `add_timeout` from other threads.
+        Instead, you must use `add_callback` to transfer control to the
+        `IOLoop`'s thread, and then call `add_timeout` from there.
+        """
+        if isinstance(deadline, numbers.Real):
+            return self.call_at(deadline, callback, *args, **kwargs)
+        else:
+            raise TypeError("Unsupport deadline %r" % deadline)
+
+    def call_at(self, deadline, callback, *args, **kwargs):
+        timeout = _Timeout(
+            deadline,
+            functools.partial(callback, *args, **kwargs),
+            self)
+        heapq.heappush(self._timeouts, timeout)
+        return timeout
+
+    def remove_timeout(self, timeout):
+        # Removing from a heap is complicated, so just leave the defunct
+        # timeout object in the queue (see discussion in
+        # http://docs.python.org/library/heapq.html).
+        # If this turns out to be a problem, we could add a garbage
+        # collection pass whenever there are too many dead timeouts.
+        timeout.callback = None
+        self._cancellations += 1
+
+    def _run_callback(self, callback):
+        """Runs a callback with error handing."""
+        try:
+            callback()
+        except Exception:
+            self.handle_callback_exception(callback)
+
+    def add_future(self, future, callback):
+        if future.done():
+            callback(future)
+        else:
+            future.add_done_callback(lambda f: self.add_callback(callback, f))
+
+    def run_in_exector(self, executor, callback, func, *args):
+        """Runs a function in a ``concurrent.futures.Executor``. If
+        ``executor`` is ``None``, the IO loop's default executor will be used.
+
+        Use `functools.partial` to pass keyword arguments to ``func``.
+
+        .. versionadded:: 5.0
+        """
+        if ThreadPoolExecutor is None:
+            raise RuntimeError(
+                "concurrent.futures is required to use IOLoop.run_in_executor")
+
+        if executor is None:
+            if not hasattr(self, '_executor'):
+                from middleman.process import cpu_count
+                # Changed in version 3.5: If max_workers is None or not given,
+                # it will default to the number of processors on the machine,
+                # multiplied by 5, assuming that ThreadPoolExecutor is often
+                # used to overlap I/O instead of CPU work and the number of
+                #  workers should be higher than the number of workers
+                # for ProcessPoolExecutor.
+                self._executor = ThreadPoolExecutor(max_workers=(cpu_count() * 5))
+            executor = self._executor
+        future = executor.submit(func, *args)
+        self.add_future(future, callback)
+        return future
+
+    def add_callback(self, callback, *args, **kwargs):
+        if self._closing:
+            return
+        # Blindly insert into self._callbacks. This is safe even
+        # from signal handlers because deque.append is atomic.
+        self._callbacks.append(functools.partial(
+            callback, *args, **kwargs))
+        if threading.get_ident() != self._thread_ident:
+            # This will write one byte but Waker.consume() reads many
+            # at once, so it's ok to write even when not strictly
+            # necessary.
+            self._waker.wake()
+        else:
+            # If we're on the IOLoop's thread, we don't need to wake anyone.
+            pass
+
+
+class _Timeout:
+    """An IOLoop timeout, a UNIX timestamp and a callback"""
+
+    # Reduce memory overhead when there are lots of pending callbacks
+    __slots__ = ['deadline', 'callback', 'tdeadline']
+
+    def __init__(self, deadline, callback, io_ioop):
+        if not isinstance(deadline, numbers.Real):
+            raise TypeError("Unsupported deadline %r" % deadline)
+        self.deadline = deadline
+        self.callback = callback
+        self.tdeadline = (deadline, next(io_ioop._timeout_counter))
+
+    # Comparison methods to sort by deadline, with object id as a tiebreaker
+    # to guarantee a consistent ordering.  The heapq module uses __le__
+    # in python2.5, and __lt__ in 2.6+ (sort() and most other comparisons
+    # use __lt__).
+    def __lt__(self, other):
+        return self.tdeadline < other.tdeadline
+
+    def __le__(self, other):
+        return self.tdeadline <= other.tdeadline
+
+
+class PeriodicCallback:
+    """Schedules the given callback to be called periodically.
+
+    The callback is called every ``callback_time`` milliseconds.
+
+    If ``jitter`` is specified, each callback time will be randomly
+    selected within a window of ``jitter * callback_time`` milliseconds.
+    Jitter can be used to reduce alignment of events with similar periods.
+    A jitter of 0.1 means allowing a 10% variation in callback time.
+    The window is centered on ``callback_time`` so the total number of
+    calls within a given interval should not be significantly affected by
+    adding jitter.
+
+    If the callback runs for longer than ``callback_time`` milliseconds,
+    subsequent invocations will be skipped to get back on schedule.
+
+    `start` must be called after the `PeriodicCallback` is created."""
+    def __init__(self, callback, callback_time, jitter=0):
+        self.callback = callback
+        if callback_time <= 0:
+            raise ValueError("Periodic callback must have a positive callback_time")
+        self.callback_time = callback_time
+        self.jitter = jitter
+        self._running = False
+        self._timeout = None
+
+    def start(self):
+        """Starts the timer."""
+        # Looking up the IOLoop here allows to first instantiate the
+        # PeriodicCallback in another thread, then start it using
+        # IOLoop.add_callback().
+        self.io_loop = IOLoop.current()
+        self._running = True
+        self._next_timeout = self.io_loop.time()
+        self._schedule_next()
+
+    def stop(self):
+        """Stops the timer."""
+        self._running = False
+        if self._timeout is not None:
+            self.io_loop.remove_timeout(self._timeout)
+            self._timeout = None
+
+    def is_running(self):
+        """Return True if this `.PeriodicCallback` has been started."""
+        return self._running
+
+    def _run(self):
+        if not self._running:
+            return
+        try:
+            return self.callback()
+        except Exception:
+            self.io_loop.handle_callback_exception(self.callback)
+        finally:
+            self._schedule_next()
+
+    def _schedule_next(self):
+        if self._running:
+            self._update_next(self.io_loop.time())
+            self._timeout = self.io_loop.add_timeout(self._next_timeout, self._run)
+
+    def _update_next(self, current_time):
+        callback_time_sec = self.callback_time / 1000.0
+        if self.jitter:
+            # apply jitter fraction
+            callback_time_sec *= 1 + (self.jitter * (random.random() - 0.5))
+        if self._next_timeout <= current_time:
+            # The period should be measured from the start of one call
+            # to the start of the next. If one call takes too long,
+            # skip cycles to get back to a multiple of the original
+            # schedule.
+            self._next_timeout += (math.floor((current_time - self._next_timeout) /
+                                              callback_time_sec) + 1) * callback_time_sec
+        else:
+            # If the clock moved backwards, ensure we advance the next
+            # timeout instead of recomputing the same value again.
+            # This may result in long gaps between callbacks if the
+            # clock jumps backwards by a lot, but the far more common
+            # scenario is a small NTP adjustment that should just be
+            # ignored.
+            #
+            # Note that on some systems if time.time() runs slower
+            # than time.monotonic() (most common on windows), we
+            # effectively experience a small backwards time jump on
+            # every iteration because PeriodicCallback uses
+            # time.time() while asyncio schedules callbacks using
+            # time.monotonic().
+            # https://github.com/tornadoweb/tornado/issues/2333
+            self._next_timeout += callback_time_sec
