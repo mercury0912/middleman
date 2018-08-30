@@ -10,7 +10,7 @@ DAEMON_RUNNING = ['start', 'stop', 'restart', 'off']
 def daemonize(opts):
     if opts.daemon == 'off':
         return
-    dam = daemon.DaemonContext(pidfile_path=opts.pid_file)
+    dam = daemon.DaemonContext(pidfile_path=opts.pid_file, uid=opts.uid)
     try:
         handler = getattr(dam, opts.daemon)
         handler()

@@ -47,6 +47,10 @@ class StreamClosedError(IOError):
     """Exception raised by `IOStream` methods when the stream is closed."""
 
 
+class StreamConnresetError(OSError):
+    """Exception raised bye ``_ERRNO_CONNRESET``"""
+
+
 class _StreamBuffer(object):
     """
     A specialized buffer that tries to avoid copies when large pieces
@@ -141,10 +145,10 @@ class IOStream:
     READ_CHUNK_SIZE = 1024 * 16
     MAX_BUFFER_SIZE = 104857600
 
-    def __init__(self, socket=None,
+    def __init__(self, socket,
                  max_buffer_size=MAX_BUFFER_SIZE,
                  read_chunk_size=READ_CHUNK_SIZE,
-                 max_write_buffer_size=None):
+                 max_write_buffer_size=MAX_BUFFER_SIZE):
         self.socket = socket
         self.socket.setblocking(False)
         self._closed = False
@@ -157,6 +161,7 @@ class IOStream:
         self.read_buffer_pos = 0
         self.read_buffer_size = 0
         self.read_target_bytes = None
+        self._total_read_done_index = 0
         self._write_buffer = _StreamBuffer()
         self.max_write_buffer_size = max_write_buffer_size
         self._total_write_done_index = 0
@@ -166,11 +171,8 @@ class IOStream:
     def read_from_fd(self, buf):
         try:
             return self.socket.recv_into(buf)
-        except OSError as e:
-            if e.errno in _ERRNO_WOULDBLOCK:
-                return None
-            else:
-                raise
+        except BlockingIOError:
+            return None
         finally:
             buf = None
 
@@ -186,20 +188,23 @@ class IOStream:
                     # an error to minimize log spam  (the exception will
                     # be raised for apps that care).
                     if e.errno in _ERRNO_CONNRESET:
-                        log = gen_log.info
+                        gen_log.info("Read error on fd %s: %s",
+                                     self.fileno(), e)
+                        raise StreamConnresetError
                     else:
-                        log = gen_log.error
-                    log("Read error on fd %s: %s", self.fileno(), e)
-                    raise
-            break
-        # _ERRNO_WOULDBLOCK
+                        gen_log.error("Read error on fd %s: %s",
+                                      self.fileno(), e)
+                        raise
+            else:
+                break
+        # BlockingIOError
         if bytes_read is None:
             return None
 
         if bytes_read == 0:
             self.FIN_received = True
             return 0
-
+        self._total_read_done_index += bytes_read
         self.read_buffer += self._read_chunk[:bytes_read]
         self.read_buffer_size += bytes_read
         if self.read_buffer_size > self.max_buffer_size:
@@ -232,7 +237,7 @@ class IOStream:
             del data
 
     def handle_write(self):
-        total_bytes = 0
+        total_written = 0
         while True:
             size = len(self._write_buffer)
             if not size:
@@ -246,25 +251,29 @@ class IOStream:
                     # with more than 128KB at a time.
                     size = 128 * 1024
                 num_bytes = self.write_to_fd(self._write_buffer.peek(size))
+            except BlockingIOError:
+                break
+            except OSError as e:
+                if e.errno == errno.EINTR:
+                    continue
+                elif e.errno in _ERRNO_CONNRESET:
+                    # Broken pipe errors are usually caused by connection
+                    # reset, and its better to not log EPIPE errors to
+                    # minimize log spam
+                    gen_log.info("Write error on fd %s: %s",
+                                 self.fileno(), e)
+                    raise StreamConnresetError
+                else:
+                    gen_log.error("Write error on fd %s: %s",
+                                  self.fileno(), e)
+                    raise
+            else:
                 if num_bytes == 0:
                     break
                 self._write_buffer.advance(num_bytes)
                 self._total_write_done_index += num_bytes
-                total_bytes += num_bytes
-            except OSError as e:
-                if e.errno in _ERRNO_WOULDBLOCK:
-                    break
-                else:
-                    if e.errno in _ERRNO_CONNRESET:
-                        # Broken pipe errors are usually caused by connection
-                        # reset, and its better to not log EPIPE errors to
-                        # minimize log spam
-                        log = gen_log.info
-                    else:
-                        log = gen_log.error
-                    log("Write error on fd %s: %s", self.fileno(), e)
-                    raise
-        return total_bytes
+                total_written += num_bytes
+        return total_written
 
     def write(self, data):
         if self._closed:
@@ -275,9 +284,10 @@ class IOStream:
                 raise StreamBufferFullError("Reached maximum write buffer size %s" %
                                             self.max_write_buffer_size)
             self._write_buffer.append(data)
-        self.handle_write()
+        nwrite = self.handle_write()
         if self._write_buffer:
             self.add_io_state(self.io_loop.WRITE)
+        return nwrite
 
     def writing(self):
         """Returns true if we are currently writing to the stream."""
@@ -315,6 +325,13 @@ class IOStream:
         elif not self._state & state:
             self._state = self._state | state
             self.io_loop.update_handler(self.socket, self._state)
+
+    def update_io_state(self, state):
+        if self._state != state:
+            self.io_loop.update_handler(self.socket, self._state)
+
+    def remove_event(self, mask):
+        self.io_loop.remove_event(self.socket, mask)
 
     def fileno(self):
         return self.socket.fileno()

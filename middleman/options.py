@@ -18,6 +18,8 @@ from middleman.platform.auto import DAEMON_RUNNING
 
 _opt_choices_map = {'logging': Log.LOGGING_LEVEL, 'daemon': DAEMON_RUNNING}
 _opt_files = ['config_file', 'log_file_prefix', 'pid_file']
+_LOCALHOST = '127.0.0.1'
+_LOCALHOST_V6 = '::1'
 
 
 def display_options_info(opts):
@@ -25,9 +27,12 @@ def display_options_info(opts):
         return
     print()
     print('=' * 80)
+    isserver = opts.server
     for attr in sorted(vars(opts)):
         val = getattr(opts, attr)
         if attr == 'V':
+            continue
+        if isserver and attr.startswith("remote"):
             continue
         print("%-30s %s" % (attr, val))
     print('=' * 80)
@@ -62,25 +67,39 @@ def set_abspath(opts, opt_files):
 def _parse_command_line():
     parser = argparse.ArgumentParser(
         description="I'm just a middleman.", add_help=False,
-        usage="%(prog)s [OPTION]...",
+        usage="%(prog)s (-r remote|-s) [OPTION]...",
         epilog="Online help: https://github.com/mercury0912/middleman")
-    group_proxy = parser.add_argument_group('Service-level options')
+    group_proxy = parser.add_argument_group('service-level options')
     group_proxy.add_argument(
-        'hostname', nargs='?', default='127.0.0.1',
-        help='IP address or hostname (default: %(default)s)')
+        '-a', dest='local', default=_LOCALHOST, metavar='local',
+        help='local IP address or hostname (default: %(default)s)')
+    group_proxy.add_argument('-l', dest='local_port', type=int, default=8388,
+                             metavar='local_port',
+                             help='local listen port (default: %(default)s)')
+    # group_proxy.add_argument('-r', dest='remote',
+    #                          default='_LOCALHOST', metavar='remote',
+    #                          help='server endpoint address')
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument('-s', dest='server', action='store_true',
+                             help='run as the server (default: %(default)s)')
+    group.add_argument('-r', dest='remote',
+                             default=_LOCALHOST, metavar='remote',
+                             help='server endpoint address')
     group_proxy.add_argument(
-        '-p', dest='port', type=int, default=1080, metavar='port',
-        help='tcp por number (default: %(default)s)')
-    group_proxy.add_argument('-c', dest='client', action='store_false',
-                             help='run as the client (default: %(default)s)')
+        '-p', dest='remote_port', type=int, default=1080,
+        metavar='remote_port',
+        help='remote listen port: invalid in server mode '
+             '(default: %(default)s)')
+    # group_proxy.add_argument('-s', dest='server', action='store_true',
+    #                          help='run as the server (default: %(default)s)')
     group_proxy.add_argument('-t', dest='timeout', type=int,
                              default=300, metavar='timeout',
                              help='timeout in seconds for idle connections (default: %(default)ss)')
 
-    group_log = parser.add_argument_group('Logging control')
-    group_log.add_argument('--logging', default='warning',
+    group_log = parser.add_argument_group('logging control')
+    group_log.add_argument('-L', dest='logging', metavar='logging',
+                           default='warning',
                            choices=Log.LOGGING_LEVEL,
-                           dest='logging',
                            help='set log level (default: %(default)s)')
     group_log.add_argument('-B', '--log_both', action='store_true',
                            dest="log_both",
@@ -101,7 +120,7 @@ def _parse_command_line():
                            help=('number of log files to keep '
                                  '(default: %(default)s)'))
 
-    group_misc = parser.add_argument_group('Miscellaneous')
+    group_misc = parser.add_argument_group('miscellaneous')
     group_misc.add_argument('-v', '--version', action='version',
                             version='%(prog)s ' + __version__)
     group_misc.add_argument('-h', '--help', action='help',
@@ -109,7 +128,7 @@ def _parse_command_line():
     group_misc.add_argument('-V', action='store_true', default=argparse.SUPPRESS,
                             help='show configure options and exit')
 
-    group_gen = parser.add_argument_group('General options')
+    group_gen = parser.add_argument_group('general options')
     group_gen.add_argument('-f', metavar='config_file', dest='config_file',
                            help='specify configuration file')
     if os.name != 'nt':
@@ -117,7 +136,10 @@ def _parse_command_line():
             '-d', default='off', choices=DAEMON_RUNNING,
             dest='daemon', help='daemon mode default: %(default)s)')
         group_gen.add_argument(
-            '-f', metavar='pid_file', dest='pid_file',
+            '-u', dest='uid', type=int, default=os.getuid(), metavar='uid',
+            help='set the process owner (default: %(default)s')
+        group_gen.add_argument(
+            '--pid', metavar='pid_file', dest='pid_file',
             default='/var/run/middleman.pid',
             help='set pid file (default: %(default)s)')
     args = parser.parse_args()

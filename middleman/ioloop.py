@@ -187,21 +187,27 @@ class IOLoop:
     def handle_callback_exception(callback):
         gen_log.error("Exception in callback %r", callback, exc_info=True)
 
-    def add_handler(self, fileobj, events, handler):
+    def add_handler(self, fileobj, events, data):
         try:
-            self._impl.register(fileobj, events, handler)
+            self._impl.register(fileobj, events, data)
         except (ValueError, KeyError):
             gen_log.exception("Error adding fileobj to IOLoop")
 
-    def update_handler(self, fileobj, events, handler=None):
+    def update_handler(self, fileobj, events, data=None):
         try:
-            if handler is not None:
-                self._impl.modify(fileobj, events, handler)
+            if data is not None:
+                self._impl.modify(fileobj, events, data)
             else:
                 key = self._impl.get_key(fileobj)
                 self._impl.modify(fileobj, events, key.data)
         except (ValueError, KeyError):
             gen_log.exception("Error updating fileobj to IOLoop")
+
+    def remove_event(self, fileobj, mask):
+        fd = util.fileobj_to_fd(fileobj)
+        key_mask = self._events.get(fd, None)
+        if key_mask is not None and key_mask[1] & ~mask == 0:
+            self._events.pop(fd)
 
     def remove_handler(self, fileobj):
         try:
@@ -314,8 +320,8 @@ class IOLoop:
                             self.handle_callback_exception(key_mask)
                     except Exception:
                         self.handle_callback_exception(key_mask)
-                # Release resources held by us
-                key_mask = handler_func = None
+                    # Release resources held by us
+                    key_mask = handler_func = None
         finally:
             self._stopped = False
             IOLoop._current.instance = old_current

@@ -1,6 +1,3 @@
-# sys.argv[1:] = '-c /home/mercury/python/middleman/middleman.conf -V'.split()
-# sys.argv[1:] = '-B'.split()
-
 from middleman.log import Log
 from middleman.options import options, display_options_info
 from middleman.platform import auto
@@ -19,7 +16,7 @@ def main():
 
     event_loop = ioloop.IOLoop.current()
     server = TCPServer(options)
-    server.bind(options.port, options.hostname)
+    server.bind(options.local_port, options.local)
     server.start()
     event_loop.start()
 
