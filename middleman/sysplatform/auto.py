@@ -4,9 +4,9 @@ import os
 
 
 if os.name == 'nt':
-    from middleman.platform.common import Waker
-    from middleman.platform.windows import (
+    from middleman.sysplatform.common import Waker
+    from middleman.sysplatform.windows import (
         set_close_exec, daemonize, DAEMON_RUNNING)
 else:
-    from middleman.platform.posix import (
+    from middleman.sysplatform.posix import (
         set_close_exec, daemonize, DAEMON_RUNNING, Waker)

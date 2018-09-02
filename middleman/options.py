@@ -14,7 +14,7 @@ import sys
 from middleman import __version__
 from middleman.log import Log
 from middleman.util import exit_prog
-from middleman.platform.auto import DAEMON_RUNNING
+from middleman.sysplatform.auto import DAEMON_RUNNING
 
 _opt_choices_map = {'logging': Log.LOGGING_LEVEL, 'daemon': DAEMON_RUNNING}
 _opt_files = ['config_file', 'log_file_prefix', 'pid_file']

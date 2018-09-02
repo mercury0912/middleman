@@ -2,7 +2,7 @@ import fcntl
 import os
 
 from middleman.util import exit_prog
-from middleman.platform import daemon, common
+from middleman.sysplatform import daemon, common
 
 DAEMON_RUNNING = ['start', 'stop', 'restart', 'off']
 

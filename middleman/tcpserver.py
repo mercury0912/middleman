@@ -8,7 +8,9 @@ from middleman.log import gen_log
 from middleman.ioloop import IOLoop, PeriodicCallback
 from middleman.netutil import bind_sockets, add_accept_handler
 from middleman.iostream import IOStream, StreamConnresetError
-from middleman.platform.auto import set_close_exec
+from middleman.sysplatform.auto import set_close_exec
+
+import objgraph
 
 
 class ProtocolError(Exception):

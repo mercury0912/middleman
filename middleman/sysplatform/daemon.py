@@ -7,7 +7,7 @@ import signal
 import sys
 import time
 
-from middleman.platform import pidlockedfile
+from middleman.sysplatform import pidlockedfile
 
 
 class DaemonError(Exception):

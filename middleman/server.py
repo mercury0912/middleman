@@ -1,12 +1,16 @@
+import sys
+sys.argv[1:] = "-B -l 1080 -s -P server -a 192.168.92.132".split()
+
 from middleman.log import Log
 from middleman.options import options, display_options_info
-from middleman.platform import auto
+from middleman.sysplatform import auto
 from middleman.util import exit_prog
 from middleman import ioloop
 from middleman.tcpserver import TCPServer
 
 
 def main():
+    print(sys.argv)
     display_options_info(options)
     auto.daemonize(options)
     try:

@@ -4,7 +4,7 @@ import socket
 import sys
 
 from middleman.ioloop import IOLoop
-from middleman.platform.auto import set_close_exec
+from middleman.sysplatform.auto import set_close_exec
 
 
 # ThreadedResolver runs getaddrinfo on a thread. If the hostname is unicode,
