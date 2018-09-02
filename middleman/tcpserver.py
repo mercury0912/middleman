@@ -311,7 +311,7 @@ class _TcpRelayHandler:
                 buf_pos += 4
                 dest_port = struct.unpack('>H', buf[buf_pos:buf_pos+2])
                 self._remote_address = (socket.AF_INET,
-                                        (dest_addr, dest_port))
+                                        (dest_addr, dest_port[0]))
                 close_connection = False
             elif atyp == 0x03:  # DOMAINNAME
                 if stream.read_buffer_size < 4 + 1:
@@ -340,7 +340,7 @@ class _TcpRelayHandler:
                 buf_pos += 16
                 dest_port = struct.unpack('>H', buf[buf_pos:buf_pos+2])
                 self._remote_address = (socket.AF_INET6,
-                                        (dest_addr, dest_port))
+                                        (dest_addr, dest_port[0]))
                 close_connection = False
             else:
                 gen_log.info("SOCKS5 unsupported address type: %s" % atyp)
