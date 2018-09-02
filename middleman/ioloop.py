@@ -193,13 +193,9 @@ class IOLoop:
         except (ValueError, KeyError):
             gen_log.exception("Error adding fileobj to IOLoop")
 
-    def update_handler(self, fileobj, events, data=None):
+    def update_handler(self, fileobj, events, data):
         try:
-            if data is not None:
                 self._impl.modify(fileobj, events, data)
-            else:
-                key = self._impl.get_key(fileobj)
-                self._impl.modify(fileobj, events, key.data)
         except (ValueError, KeyError):
             gen_log.exception("Error updating fileobj to IOLoop")
 
@@ -489,6 +485,7 @@ class PeriodicCallback:
         if self._timeout is not None:
             self.io_loop.remove_timeout(self._timeout)
             self._timeout = None
+        self.callback = None
 
     def is_running(self):
         """Return True if this `.PeriodicCallback` has been started."""

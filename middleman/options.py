@@ -137,7 +137,7 @@ def _parse_command_line():
             dest='daemon', help='daemon mode default: %(default)s)')
         group_gen.add_argument(
             '-u', dest='uid', type=int, default=os.getuid(), metavar='uid',
-            help='set the process owner (default: %(default)s')
+            help='set the process owner (default: %(default)s)')
         group_gen.add_argument(
             '--pid', metavar='pid_file', dest='pid_file',
             default='/var/run/middleman.pid',

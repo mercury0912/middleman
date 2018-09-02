@@ -15,22 +15,28 @@ class ProtocolError(Exception):
     pass
 
 
-class _TcpRelayHandler:
-    class Stage(enum.IntEnum):
-        INIT = 0,
-        SOCKS5_METHOD = 1,
-        SOCK5_CMD = 2,
-        CONNECTING = 3,
-        STREAM = 4
+class _Stage(enum.IntEnum):
+    INIT = 0,
+    SOCKS5_METHOD = 1,
+    SOCK5_CMD = 2,
+    CONNECTING = 3,
+    STREAM = 4
 
-    SOCKET_TIMEOUT = 5.0
+
+_SOCKET_TIMEOUT = 5.0
+
+
+class _TcpRelayHandler:
 
     class _StreamPair:
-        def __init__(self, local, remote=None):
+        def __init__(self, handler, local, remote=None):
             # on behalf of the connection which we 'accept'
-            self.local = IOStream(local)
+            self.local = IOStream(local, handler=handler)
             # connection to remote middleman server or web server"
-            self.remote = None if remote is None else IOStream(remote)
+            if remote is not None:
+                self.remote = IOStream(remote, handler=handler)
+            else:
+                self.remote = None
 
         def close(self):
             if self.local is not None:
@@ -40,15 +46,17 @@ class _TcpRelayHandler:
                 self.remote.close()
                 self.remote = None
 
-    def __init__(self, server, local_socket, opt):
+    def __init__(self, server, local_socket, opt, ioloop=None):
         self._server = server
         self._opt = opt
-        self._io_loop = IOLoop.current()
-        self._streams = self._StreamPair(local_socket)
+        self._io_loop = ioloop or IOLoop.current()
+        self._streams = self._StreamPair(self._handle_events, local_socket)
         self._remote_address = None
-        self._stage = self.Stage.INIT
+        self._stage = _Stage.INIT
         self._closed = False
+        self._future = None
 
+        # TODO: add support for AF_INET and AF_UNSPEC
         if not opt.server:
             self._remote_address = (socket.AF_INET,
                                     (opt.remote, opt.remote_port))
@@ -68,27 +76,35 @@ class _TcpRelayHandler:
 
     def start(self):
         self._cron.start()
-        self._streams.local.add_io_state(IOLoop.READ, self._handle_events)
+        self._streams.local.add_io_state(IOLoop.READ)
         if self._opt.server:
-            self._stage = self.Stage.SOCKS5_METHOD
+            self._stage = _Stage.SOCKS5_METHOD
         else:
-            self._stage = self.Stage.CONNECTING
+            self._stage = _Stage.CONNECTING
 
     def stop(self):
         if self._closed:
             return
         self._closed = True
+        # attempt to cancel the call
+        if self._future is not None:
+            if not self._future.done():
+                self._future.cancel()
+            self._future = None
         # stop timer
         self._cron.stop()
         self._cron = None
 
         # remove handler from server
         self._server.remove_handler(self._streams.local.socket)
-
         # close connection
         self._streams.close()
         self._streams = None
+
         self._server = None
+        self._remote_address = None
+        self._opt = None
+        self._io_loop = None
 
     def _handle_events(self, fileobj, events):
         if self.closed():
@@ -125,10 +141,14 @@ class _TcpRelayHandler:
         else:
             stream = self._streams.remote
         if stream is not None:
-            state = IOLoop.READ
-            if stream.writing():
-                state |= IOLoop.WRITE
-            stream.update_io_state(state)
+            self._update_stream(stream)
+
+    @staticmethod
+    def _update_stream(stream):
+        state = IOLoop.READ
+        if stream.writing():
+            state |= IOLoop.WRITE
+        stream.update_io_state(state)
 
     def _handle_read(self, islocal):
         try:
@@ -145,12 +165,12 @@ class _TcpRelayHandler:
             return
         if nread:
             self._update_last_interaction(nread=nread)
-            if self._stage == self.Stage.STREAM:
+            if self._stage == _Stage.STREAM:
                 self._relay(self._streams.local, self._streams.remote)
-            elif (self._stage == self.Stage.SOCKS5_METHOD or
-                  self._stage == self.Stage.SOCK5_CMD):
+            elif (self._stage == _Stage.SOCKS5_METHOD or
+                  self._stage == _Stage.SOCK5_CMD):
                 self._parse_sock5()
-            elif self._stage == self.Stage.CONNECTING:
+            elif self._stage == _Stage.CONNECTING:
                 if not self._opt.server:
                     self._io_loop.run_in_exector(
                         None, self._remote_gotconnected,
@@ -158,7 +178,6 @@ class _TcpRelayHandler:
                         self._remote_address[0],
                         self._remote_address[1])
         else:
-            # if self._stage != self.Stage.STREAM:
             self.stop()
 
     def _on_remote_read(self):
@@ -167,7 +186,7 @@ class _TcpRelayHandler:
             return
         if nread:
             self._update_last_interaction(nread=nread)
-            assert self._stage == self.Stage.STREAM
+            assert self._stage == _Stage.STREAM
             self._relay(self._streams.remote, self._streams.local)
         else:
             self.stop()
@@ -197,15 +216,18 @@ class _TcpRelayHandler:
 
     def _relay(self, src, dest):
         readbuf = src.read_buffer
-        nwrite = dest.write(readbuf[src.read_buffer_pos:src.read_buffer_size])
-        self._update_last_interaction(nwrite=nwrite)
+        nwrite = dest.write(
+            (readbuf[src.read_buffer_pos:src.read_buffer_size]))
+        # update dest io state
+        self._update_stream(dest)
         dest.remove_event(IOLoop.WRITE)
+        self._update_last_interaction(nwrite=nwrite)
         src.consume(src.read_buffer_size)
 
     def _parse_sock5(self):
-        if self._stage == self.Stage.SOCKS5_METHOD:
+        if self._stage == _Stage.SOCKS5_METHOD:
             self._parse_method()
-        elif self._stage == self.Stage.SOCK5_CMD:
+        elif self._stage == _Stage.SOCK5_CMD:
             self._parse_cmd()
 
     def _parse_method(self):
@@ -253,7 +275,7 @@ class _TcpRelayHandler:
         if stream.read_target_bytes is not None:
             stream.read_target_bytes = None
         stream.consume(total)
-        self._stage = self.Stage.SOCK5_CMD
+        self._stage = _Stage.SOCK5_CMD
 
     def _parse_cmd(self):
         """parse client request details"""
@@ -328,8 +350,8 @@ class _TcpRelayHandler:
         if not close_connection:
             stream.consume(total_octets)
             stream.read_target_bytes = None
-            self._stage = self.Stage.CONNECTING
-            self._io_loop.run_in_exector(
+            self._stage = _Stage.CONNECTING
+            self._future = self._io_loop.run_in_exector(
                 None, self._remote_gotconnected, self._create_connection,
                 self._remote_address[0], self._remote_address[1])
         else:
@@ -341,7 +363,7 @@ class _TcpRelayHandler:
             raise ProtocolError
 
     @staticmethod
-    def _create_connection(af, address, timeout=SOCKET_TIMEOUT):
+    def _create_connection(af, address, timeout=_SOCKET_TIMEOUT):
         if af == socket.AF_UNSPEC:
             return socket.create_connection(address, timeout)
         else:
@@ -358,79 +380,83 @@ class _TcpRelayHandler:
 
     def _create_remote_stream(self, sock):
         set_close_exec(sock.fileno())
-        self._streams.remote = IOStream(sock)
-        self._streams.remote.add_io_state(IOLoop.READ, self._handle_events)
-        self._stage = self.Stage.STREAM
+        self._streams.remote = IOStream(sock, handler=self._handle_events)
+        self._streams.remote.add_io_state(IOLoop.READ)
+        self._stage = _Stage.STREAM
 
-    def _remote_gotconnected(self, feature):
+    def _remote_gotconnected(self, future):
         if self.closed():
             return
 
-        hostname, port = self._remote_address[1]
-        if self._opt.server:
-            exc = None
-            close_connection = True
-            af = self._remote_address[0]
+        try:
             hostname, port = self._remote_address[1]
-            try:
-                conn = feature.result()
+            if self._opt.server:
+                exc = None
+                close_connection = True
+                af = self._remote_address[0]
+                try:
+                    conn = future.result()
 
-                # On IPv6, ignore flow_info and scope_id
-                raddr, rport = conn.getpeername()[:2]
-                laddr, lport = conn.getsockname()[:2]
-                gen_log.info("connected %s: %s:%s from %s:%s",
-                             hostname, raddr, rport, laddr, lport)
-                bnd_addr = socket.inet_pton(conn.family, laddr)
-                bnd_port = struct.pack("!H", lport)
-                if conn.family == socket.AF_INET:
-                    atyp = b'\x01'
-                else:
-                    atyp = b'\x04'
-                resp = bytearray(b'\x05\x00\x00')  # VER | REP |  RSV
-                resp += atyp
-                resp += bnd_addr
-                resp += bnd_port
-
-                self._create_remote_stream(conn)
-                close_connection = False
-            except TimeoutError as _:
-                exc = _
-                resp = bytearray(b'\x05\x06\x00')  # X'06' TTL expired
-            except Exception as _:
-                exc = _
-                resp = bytearray(b'\x05\x03\x00')  # X'03' Network unreachable
-
-            if not close_connection:
-                nwrite = self._streams.local.write(resp)
-                self._update_last_interaction(nwrite=nwrite)
-            else:
-                if af == socket.AF_UNSPEC:
-                    resp += b'\x03'
-                    addr = hostname.encode("idna")
-                    resp += bytes([len(addr)])
-                else:
-                    if af == socket.AF_INET:
-                        resp += b'\x01'
+                    # On IPv6, ignore flow_info and scope_id
+                    raddr, rport = conn.getpeername()[:2]
+                    laddr, lport = conn.getsockname()[:2]
+                    gen_log.info("connected %s: %s:%s from %s:%s",
+                                 hostname, raddr, rport, laddr, lport)
+                    bnd_addr = socket.inet_pton(conn.family, laddr)
+                    bnd_port = struct.pack("!H", lport)
+                    if conn.family == socket.AF_INET:
+                        atyp = b'\x01'
                     else:
-                        resp += b'\x04'
-                    addr = socket.inet_pton(af, hostname)
-                resp += addr
-                resp += struct.pack("!H", port)
-                gen_log.info("SOCK5 failed to connect '%s:%s' (%s)",
-                             hostname, port, exc)
-                nwrite = self._streams.local.write(resp)
-                self._update_last_interaction(nwrite=nwrite)
-                self.stop()
-        else:
-            try:
-                conn = feature.result()
-                self._create_remote_stream(conn)
-                # need to do the first relay
-                self._relay(self._streams.local, self._streams.remote)
-            except Exception as exc:
-                gen_log.error("failed to connect '%s:%s' (%s)",
-                              hostname, port, exc)
-                self.stop()
+                        atyp = b'\x04'
+                    resp = bytearray(b'\x05\x00\x00')  # VER | REP |  RSV
+                    resp += atyp
+                    resp += bnd_addr
+                    resp += bnd_port
+
+                    self._create_remote_stream(conn)
+                    close_connection = False
+                except (socket.timeout, TimeoutError) as _:
+                    exc = _
+                    resp = bytearray(b'\x05\x06\x00')  # X'06' TTL expired
+                except Exception as _:
+                    exc = _
+                    resp = bytearray(b'\x05\x03\x00')  # X'03' Network unreachable
+
+                if not close_connection:
+                    nwrite = self._streams.local.write(resp)
+                    self._update_last_interaction(nwrite=nwrite)
+                else:
+                    if af == socket.AF_UNSPEC:
+                        resp += b'\x03'
+                        addr = hostname.encode("idna")
+                        resp += bytes([len(addr)])
+                    else:
+                        if af == socket.AF_INET:
+                            resp += b'\x01'
+                        else:
+                            resp += b'\x04'
+                        addr = socket.inet_pton(af, hostname)
+                    resp += addr
+                    resp += struct.pack("!H", port)
+                    gen_log.info("SOCK5 failed to connect '%s:%s' (%s)",
+                                 hostname, port, exc)
+                    nwrite = self._streams.local.write(resp)
+                    self._update_last_interaction(nwrite=nwrite)
+                    self.stop()
+            else:
+                try:
+                    conn = future.result()
+                    self._create_remote_stream(conn)
+                    # need to do the first relay
+                    self._relay(self._streams.local, self._streams.remote)
+                except Exception as exc:
+                    gen_log.error("failed to connect '%s:%s' (%s)",
+                                  hostname, port, exc)
+                    self.stop()
+        except Exception:
+            gen_log.error("Uncaught exception, closing connection.",
+                          exc_info=True)
+            self.stop()
             return
 
 
@@ -446,7 +472,8 @@ class TCPServer:
         self.stat_net_output_bytes = 0
         self.unixtime = time.time()
         self._opt = opt
-        self._cron = PeriodicCallback(self._server_cron, 1000)
+        self._cron = PeriodicCallback(self._server_cron, 1 * 1000)
+        self._relay_num = 0
 
     def add_sockets(self, sockets):
         """Makes this server start accepting connections on the given sockets.
@@ -557,12 +584,14 @@ class TCPServer:
 
     def add_handler(self, connection, handler):
         self._handlers[connection.fileno()] = handler
+        self._relay_num += 1
 
     def remove_handler(self, connection):
         self._handlers.pop(connection.fileno())
+        self._relay_num -= 1
 
     def _handle_connection(self, connection, address):
         gen_log.info("Accepted client connection %s", address)
-        relay = _TcpRelayHandler(self, connection, self._opt)
+        relay = _TcpRelayHandler(self, connection, self._opt, self._io_loop)
         self.add_handler(connection, relay.stop)
         relay.start()

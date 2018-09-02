@@ -142,13 +142,14 @@ class _StreamBuffer(object):
 
 
 class IOStream:
-    READ_CHUNK_SIZE = 1024 * 16
+    READ_CHUNK_SIZE = 1024 * 32
     MAX_BUFFER_SIZE = 104857600
 
     def __init__(self, socket,
                  max_buffer_size=MAX_BUFFER_SIZE,
                  read_chunk_size=READ_CHUNK_SIZE,
-                 max_write_buffer_size=MAX_BUFFER_SIZE):
+                 max_write_buffer_size=MAX_BUFFER_SIZE,
+                 handler=None):
         self.socket = socket
         self.socket.setblocking(False)
         self._closed = False
@@ -167,6 +168,7 @@ class IOStream:
         self._total_write_done_index = 0
         self.FIN_received = False
         self._connecting = False
+        self._handler = handler
 
     def read_from_fd(self, buf):
         try:
@@ -312,23 +314,26 @@ class IOStream:
                 raise
             else:
                 return -1
-        self.add_io_state(self.io_loop.WRITE, handler)
+        self.add_io_state(self.io_loop.WRITE)
         return 0
 
-    def add_io_state(self, state, handler=None):
+    def add_io_state(self, state):
         if self._closed:
             return
         if self._state is None:
-            assert handler is not None
             self._state = state
-            self.io_loop.add_handler(self.socket, self._state, handler)
+            self.io_loop.add_handler(self.socket, self._state,
+                                     self._handler)
         elif not self._state & state:
             self._state = self._state | state
-            self.io_loop.update_handler(self.socket, self._state)
+            self.io_loop.update_handler(self.socket, self._state,
+                                        self._handler)
 
     def update_io_state(self, state):
         if self._state != state:
-            self.io_loop.update_handler(self.socket, self._state)
+            self._state = state
+            self.io_loop.update_handler(self.socket, self._state,
+                                        self._handler)
 
     def remove_event(self, mask):
         self.io_loop.remove_event(self.socket, mask)
@@ -341,9 +346,12 @@ class IOStream:
             self._closed = True
             if self._state is not None:
                 self.io_loop.remove_handler(self.socket)
+                self.io_loop = None
                 self._state = None
             self.socket.close()
             self.socket = None
-            self._read_chunk = None
+            self._read_chunk.release()
+            self._read_chunk= None
             self.read_buffer = None
             self._write_buffer = None
+            self._handler = None
