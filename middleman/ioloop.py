@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from middleman import util
 from middleman.log import gen_log
-from middleman.platform.auto import set_close_exec, Waker
+from middleman.sysplatform.auto import set_close_exec, Waker
 
 
 _POLL_TIMEOUT = 3600.0
@@ -369,11 +369,15 @@ class IOLoop:
         except Exception:
             self.handle_callback_exception(callback)
 
+    def _add_done_callback(self, callback, future):
+        self.add_callback(callback, future)
+
     def add_future(self, future, callback):
         if future.done():
             callback(future)
         else:
-            future.add_done_callback(lambda f: self.add_callback(callback, f))
+            func = functools.partial(self._add_done_callback, callback)
+            future.add_done_callback(func)
 
     def run_in_exector(self, executor, callback, func, *args):
         """Runs a function in a ``concurrent.futures.Executor``. If
