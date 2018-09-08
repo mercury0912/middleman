@@ -2,6 +2,7 @@ import errno
 import os
 import socket
 import sys
+from collections import namedtuple
 
 from middleman.ioloop import IOLoop
 from middleman.sysplatform.auto import set_close_exec
@@ -28,6 +29,7 @@ if hasattr(errno, "WSAEWOULDBLOCK"):
 # Default backlog used when calling sock.listen()
 _DEFAULT_BACKLOG = 128
 
+RemoteAddress = namedtuple('RemoteAddr', ['af', 'addr'])
 
 def bind_sockets(port, address=None, family=socket.AF_UNSPEC,
                  backlog=_DEFAULT_BACKLOG, flags=None, reuse_port=False):

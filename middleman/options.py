@@ -30,7 +30,7 @@ def display_options_info(opts):
     isserver = opts.server
     for attr in sorted(vars(opts)):
         val = getattr(opts, attr)
-        if attr == 'V':
+        if attr == 'V' or attr == 'passwd':
             continue
         if isserver and attr.startswith("remote"):
             continue
@@ -67,34 +67,33 @@ def set_abspath(opts, opt_files):
 def _parse_command_line():
     parser = argparse.ArgumentParser(
         description="I'm just a middleman.", add_help=False,
-        usage="%(prog)s (-r remote|-s) [OPTION]...",
+        usage="%(prog)s passwd (-r remote|-s) [OPTION]...",
         epilog="Online help: https://github.com/mercury0912/middleman")
     group_proxy = parser.add_argument_group('service-level options')
     group_proxy.add_argument(
         '-a', dest='local', default=_LOCALHOST, metavar='local',
         help='local IP address or hostname (default: %(default)s)')
-    group_proxy.add_argument('-l', dest='local_port', type=int, default=8388,
+    group_proxy.add_argument('-l', dest='local_port', type=int, default=1080,
                              metavar='local_port',
                              help='local listen port (default: %(default)s)')
-    # group_proxy.add_argument('-r', dest='remote',
-    #                          default='_LOCALHOST', metavar='remote',
-    #                          help='server endpoint address')
+    group_proxy.add_argument(
+        '-p', dest='remote_port', type=int, default=1080,
+        metavar='remote_port',
+        help='remote listen port: invalid in server mode '
+             '(default: %(default)s)')
+
+    group_proxy.add_argument('-t', dest='timeout', type=int,
+                             default=300, metavar='timeout',
+                             help='timeout in seconds for idle connections (default: %(default)ss)')
+
+    group_proxy.add_argument('passwd', metavar='passwd', help='specify passwd')
+
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument('-s', dest='server', action='store_true',
                              help='run as the server (default: %(default)s)')
     group.add_argument('-r', dest='remote',
                              default=_LOCALHOST, metavar='remote',
                              help='server endpoint address')
-    group_proxy.add_argument(
-        '-p', dest='remote_port', type=int, default=1080,
-        metavar='remote_port',
-        help='remote listen port: invalid in server mode '
-             '(default: %(default)s)')
-    # group_proxy.add_argument('-s', dest='server', action='store_true',
-    #                          help='run as the server (default: %(default)s)')
-    group_proxy.add_argument('-t', dest='timeout', type=int,
-                             default=300, metavar='timeout',
-                             help='timeout in seconds for idle connections (default: %(default)ss)')
 
     group_log = parser.add_argument_group('logging control')
     group_log.add_argument('-L', dest='logging', metavar='logging',

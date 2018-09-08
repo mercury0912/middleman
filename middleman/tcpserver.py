@@ -1,20 +1,16 @@
 import enum
+import os
 import socket
-import struct
 import time
 
+from middleman import socks5
+from middleman.encryption import Secret
+from middleman.ioloop import IOLoop, PeriodicCallback
 from middleman.util import fileobj_to_fd
 from middleman.log import gen_log
-from middleman.ioloop import IOLoop, PeriodicCallback
-from middleman.netutil import bind_sockets, add_accept_handler
+from middleman.netutil import bind_sockets, add_accept_handler, RemoteAddress
 from middleman.iostream import IOStream, StreamConnresetError
 from middleman.sysplatform.auto import set_close_exec
-
-import objgraph
-
-
-class ProtocolError(Exception):
-    pass
 
 
 class _Stage(enum.IntEnum):
@@ -22,21 +18,22 @@ class _Stage(enum.IntEnum):
     SOCKS5_METHOD = 1,
     SOCK5_CMD = 2,
     CONNECTING = 3,
-    STREAM = 4
+    CRYPTO = 4,
+    STREAM = 5
 
 
-_SOCKET_TIMEOUT = 5.0
+_SOCKET_TIMEOUT = 10
 
 
 class _TcpRelayHandler:
 
     class _StreamPair:
-        def __init__(self, handler, local, remote=None):
+        def __init__(self, handler, lsock, rsock=None):
             # on behalf of the connection which we 'accept'
-            self.local = IOStream(local, handler=handler)
+            self.local = IOStream(lsock, handler=handler)
             # connection to remote middleman server or web server"
-            if remote is not None:
-                self.remote = IOStream(remote, handler=handler)
+            if rsock is not None:
+                self.remote = IOStream(rsock, handler=handler)
             else:
                 self.remote = None
 
@@ -57,11 +54,7 @@ class _TcpRelayHandler:
         self._stage = _Stage.INIT
         self._closed = False
         self._future = None
-
-        # TODO: add support for AF_INET and AF_UNSPEC
-        if not opt.server:
-            self._remote_address = (socket.AF_INET,
-                                    (opt.remote, opt.remote_port))
+        self._secret = Secret(opt.passwd)
         # time of the last interaction, used for timeout
         self._last_interaction = server.unixtime
         self._cron = PeriodicCallback(self._timeout_cron,
@@ -79,10 +72,20 @@ class _TcpRelayHandler:
     def start(self):
         self._cron.start()
         self._streams.local.add_io_state(IOLoop.READ)
+        self._secret.set_encryptor(iv=os.urandom(16))
         if self._opt.server:
-            self._stage = _Stage.SOCKS5_METHOD
+            self._stage = _Stage.CRYPTO
+            self._socks5 = socks5.Socks5()
         else:
             self._stage = _Stage.CONNECTING
+            # TODO: add support for AF_INET and AF_UNSPEC
+            self._remote_address = RemoteAddress(
+                socket.AF_INET, (self._opt.remote, self._opt.remote_port))
+            self._io_loop.run_in_exector(
+                None, self._remote_gotconnected,
+                self._create_connection,
+                self._remote_address.af,
+                self._remote_address.addr)
 
     def stop(self):
         if self._closed:
@@ -102,11 +105,6 @@ class _TcpRelayHandler:
         # close connection
         self._streams.close()
         self._streams = None
-
-        self._server = None
-        self._remote_address = None
-        self._opt = None
-        self._io_loop = None
 
     def _handle_events(self, fileobj, events):
         if self.closed():
@@ -158,38 +156,54 @@ class _TcpRelayHandler:
                 self._on_local_read()
             else:
                 self._on_remote_read()
-        except (ProtocolError, StreamConnresetError):
+        except (socks5.Socks5Error, StreamConnresetError):
             self.stop()
 
     def _on_local_read(self):
-        nread = self._streams.local.handle_read()
+        stream = self._streams.local
+        nread = stream.handle_read()
         if nread is None:
             return
         if nread:
             self._update_last_interaction(nread=nread)
-            if self._stage == _Stage.STREAM:
-                self._relay(self._streams.local, self._streams.remote)
-            elif (self._stage == _Stage.SOCKS5_METHOD or
-                  self._stage == _Stage.SOCK5_CMD):
-                self._parse_sock5()
-            elif self._stage == _Stage.CONNECTING:
-                if not self._opt.server:
-                    self._io_loop.run_in_exector(
-                        None, self._remote_gotconnected,
-                        self._create_connection,
-                        self._remote_address[0],
-                        self._remote_address[1])
+            while (stream.read_buffer_size and
+                   stream.read_target_bytes is None):
+                if self._stage == _Stage.STREAM:
+                    self._relay(self._streams.local, self._streams.remote, True)
+                elif (self._stage == _Stage.SOCKS5_METHOD or
+                      self._stage == _Stage.SOCK5_CMD):
+                    self._handle_socks5(stream)
+                elif self._stage == _Stage.CRYPTO:
+                    if self._opt.server:
+                        if self._set_decipher(stream):
+                            self._write_chiper_para(stream)
+                            self._stage = _Stage.SOCKS5_METHOD
+                    else:
+                        self._relay(self._streams.local, self._streams.remote, True)
+                elif self._stage == _Stage.CONNECTING:
+                    break
         else:
             self.stop()
 
     def _on_remote_read(self):
-        nread = self._streams.remote.handle_read()
+        stream = self._streams.remote
+        nread = stream.handle_read()
         if nread is None:
             return
         if nread:
             self._update_last_interaction(nread=nread)
-            assert self._stage == _Stage.STREAM
-            self._relay(self._streams.remote, self._streams.local)
+            while (stream.read_buffer_size and
+                   stream.read_target_bytes is None):
+                if self._stage == _Stage.STREAM:
+                    self._relay(self._streams.remote, self._streams.local, False)
+                elif self._stage == _Stage.CRYPTO:
+                    if not self._opt.server:
+                        if self._set_decipher(stream):
+                            self._stage = _Stage.STREAM
+                    else:
+                        self._relay(self._streams.remote, self._streams.local, False)
+                else:
+                    break
         else:
             self.stop()
 
@@ -210,159 +224,95 @@ class _TcpRelayHandler:
         count = self._streams.remote.handle_write()
         self._update_last_interaction(nwrite=count)
 
+    def _write_chiper_para(self, stream):
+        para = bytearray([len(self._secret.eiv) + 1])
+        para += self._secret.eiv
+        n = stream.write(para)
+        self._update_last_interaction(nwrite=n)
+
+    @staticmethod
+    def _read_chiper_para(stream):
+        buf = stream.read_buffer
+        buf_pos = stream.read_buffer_first
+        length = buf[buf_pos]
+        if stream.read_buffer_size < length:
+            stream.read_target_bytes = length
+            return None
+        buf_pos += 1
+        iv = buf[buf_pos:buf_pos+length-1]
+        stream.consume(length)
+        return iv
+
+    def _set_decipher(self, stream):
+        iv = self._read_chiper_para(stream)
+        if iv is not None:
+            self._secret.set_decryptor(iv)
+            return True
+        else:
+            return False
+
+    @staticmethod
+    def _get_stream_readbuff_data(stream):
+        readbuf = stream.read_buffer
+        data = memoryview(readbuf[stream.read_buffer_first:stream.read_buffer_last])
+        stream.consume(len(data))
+        return data
+
+    def _decrypt(self, stream):
+        data = self._get_stream_readbuff_data(stream)
+        return self._secret.decrypt(data)
+
+    def _encrypt(self, stream):
+        data = self._get_stream_readbuff_data(stream)
+        return self._secret.encrypt(data)
+
+    def _relay(self, src, dest, islocal):
+        if ((islocal and self._opt.server) or
+                (not islocal and not self._opt.server)):
+            data = self._decrypt(src)
+        else:
+            data = self._encrypt(src)
+
+        nwrite = dest.write(data)
+        # update dest io state
+        self._update_stream(dest)
+        dest.remove_event(IOLoop.WRITE)
+        self._update_last_interaction(nwrite=nwrite)
+
+    def _handle_socks5(self, stream):
+        msg = self._decrypt(stream)
+        try:
+            if self._stage == _Stage.SOCKS5_METHOD:
+                resp = self._socks5.negotiate_method(msg)
+                self._reply_socks5_request(resp, stream)
+                self._stage = _Stage.SOCK5_CMD
+            else:
+                remote_address = self._socks5.evaluate_request(msg)
+                self._remote_address = remote_address
+                gen_log.info("connecting %s", self._remote_address.addr)
+                self._stage = _Stage.CONNECTING
+                del self._socks5
+                self._future = self._io_loop.run_in_exector(
+                    None, self._remote_gotconnected, self._create_connection,
+                    self._remote_address.af, self._remote_address.addr,
+                    _SOCKET_TIMEOUT)
+        except socks5.Socks5SizeError:
+            return
+        except socks5.Socks5NoSupportError as e:
+            resp = e.response
+            self._reply_socks5_request(resp, stream)
+            raise
+
+    def _reply_socks5_request(self, response, stream):
+        response = self._secret.encrypt(response)
+        nwrite = stream.write(response)
+        self._update_last_interaction(nwrite=nwrite)
+
     def _update_last_interaction(self, nread=0, nwrite=0):
         if nread > 0 or nwrite > 0:
             self._last_interaction = self._server.unixtime
             self._server.stat_net_input_bytes += nread
             self._server.stat_net_output_bytes += nwrite
-
-    def _relay(self, src, dest):
-        readbuf = src.read_buffer
-        nwrite = dest.write(
-            (readbuf[src.read_buffer_pos:src.read_buffer_size]))
-        # update dest io state
-        self._update_stream(dest)
-        dest.remove_event(IOLoop.WRITE)
-        self._update_last_interaction(nwrite=nwrite)
-        src.consume(src.read_buffer_size)
-
-    def _parse_sock5(self):
-        if self._stage == _Stage.SOCKS5_METHOD:
-            self._parse_method()
-        elif self._stage == _Stage.SOCK5_CMD:
-            self._parse_cmd()
-
-    def _parse_method(self):
-        """read version identifier/method selection message"""
-        # +-----+----------+----------+
-        # | VER | NMETHODS | METHODS |
-        # +-----+----------+---------+
-        # |  1  |     1   |1 to  255 |
-        # +----+----------+----------+
-        two_octets = 2  # VER + NMETHODS field
-        stream = self._streams.local
-        if stream.read_buffer_size < two_octets:
-            return
-        buf = stream.read_buffer
-        buf_pos = stream.read_buffer_pos
-        version = buf[buf_pos]
-        if version != 0x05:
-            gen_log.error("Unsupported SOCKS version %s", version)
-            raise ProtocolError
-        nmethods = buf[buf_pos + 1]
-        total = two_octets + nmethods
-        if stream.read_buffer_size < total:
-            stream.read_target_bytes = total
-            return
-        # ================
-        #  +----+--------+
-        #  |VER | METHOD |
-        #  +----+--------+
-        #  | 1  |   1    |
-        #  +----+--------+
-        # ================
-        response = bytearray(b'\x05')
-        for i in range(nmethods):
-            if buf[two_octets + i] == 0x00:  # NO AUTHENTICATION REQUIRED
-                response += b'\x00'
-                break
-        else:
-            response += b'\xff'  # NO ACCEPTABLE METHODS
-        nwrite = stream.write(response)
-        self._update_last_interaction(nwrite=nwrite)
-        if response[1]:
-            # request failed
-            gen_log.error("No supported SOCKS5 authentication method received")
-            raise ProtocolError
-        if stream.read_target_bytes is not None:
-            stream.read_target_bytes = None
-        stream.consume(total)
-        self._stage = _Stage.SOCK5_CMD
-
-    def _parse_cmd(self):
-        """parse client request details"""
-        # +----+-----+-------+------+----------+----------+
-        # |VER | CMD |  RSV  | ATYP | DST.ADDR | DST.PORT |
-        # +----+-----+-------+------+----------+----------+
-        # | 1  |  1  | X'00' |  1   | Variable |    2     |
-        # +----+-----+-------+------+----------+----------+
-        four_octets = 4  # VER + CMD + RSV + ATYP field
-        stream = self._streams.local
-        if stream.read_buffer_size < four_octets:
-            return
-        buf = stream.read_buffer
-        buf_pos = stream.read_buffer_pos
-        close_connection = True
-        total_octets = 0
-        version, cmd, rsv, atyp = buf[buf_pos:buf_pos+4]
-        buf_pos += 4
-        resp = bytearray(b'\x05')  # response version 5
-        if version != 0x05:
-            gen_log.error("Invalid SOCKS5 message version %s", version)
-            resp += b'\x01'  # general SOCKS server failure
-        elif cmd == 0x01:  # CONNECT X'01'
-            if atyp == 0x01:  # IP v4 address
-                total_octets = 4 + 4 + 2
-                if stream.read_buffer_size < total_octets:
-                    stream.read_target_bytes = total_octets
-                    return
-                dest_addr = socket.inet_ntop(socket.AF_INET,
-                                             buf[buf_pos:buf_pos+4])
-                buf_pos += 4
-                dest_port = struct.unpack('>H', buf[buf_pos:buf_pos+2])
-                self._remote_address = (socket.AF_INET,
-                                        (dest_addr, dest_port[0]))
-                close_connection = False
-            elif atyp == 0x03:  # DOMAINNAME
-                if stream.read_buffer_size < 4 + 1:
-                    stream.read_target_bytes = 5
-                    return
-                host_len = buf[buf_pos]
-                total_octets = 4 + 1 + host_len + 2
-                if stream.read_buffer_size < total_octets:
-                    stream.read_target_bytes = total_octets
-                    return
-                buf_pos += 1
-                dest_host_name = buf[buf_pos:buf_pos+host_len]
-                buf_pos += host_len
-                dest_port = struct.unpack('>H', buf[buf_pos:buf_pos + 2])
-                self._remote_address = (socket.AF_UNSPEC,
-                                        (dest_host_name.decode('idna'),
-                                         dest_port[0]))
-                close_connection = False
-            elif atyp == 0x04:
-                total_octets = 4 + 16 + 2
-                if stream.read_buffer_size < total_octets:
-                    stream.read_target_bytes = total_octets
-                    return
-                dest_addr = socket.inet_ntop(socket.AF_INET6,
-                                             buf[buf_pos:buf_pos+16])
-                buf_pos += 16
-                dest_port = struct.unpack('>H', buf[buf_pos:buf_pos+2])
-                self._remote_address = (socket.AF_INET6,
-                                        (dest_addr, dest_port[0]))
-                close_connection = False
-            else:
-                gen_log.info("SOCKS5 unsupported address type: %s" % atyp)
-                resp += b'\x08'  # X'08' Address type not supported
-        else:
-            gen_log.error("Unsupported command %s", cmd)
-            resp += b'\x07'  # X'07' Command not supported
-
-        if not close_connection:
-            stream.consume(total_octets)
-            stream.read_target_bytes = None
-            self._stage = _Stage.CONNECTING
-            self._future = self._io_loop.run_in_exector(
-                None, self._remote_gotconnected, self._create_connection,
-                self._remote_address[0], self._remote_address[1])
-        else:
-            # suppose IP v4 address
-            resp += b'\x00\x01\x00\x00\x00\x00\x00\x00'
-            nwrite = stream.write(resp)
-            self._update_last_interaction(nwrite=nwrite)
-            self.stop()
-            raise ProtocolError
 
     @staticmethod
     def _create_connection(af, address, timeout=_SOCKET_TIMEOUT):
@@ -384,81 +334,54 @@ class _TcpRelayHandler:
         set_close_exec(sock.fileno())
         self._streams.remote = IOStream(sock, handler=self._handle_events)
         self._streams.remote.add_io_state(IOLoop.READ)
-        self._stage = _Stage.STREAM
 
     def _remote_gotconnected(self, future):
         if self.closed():
             return
+        if self._opt.server:
+            try:
+                conn = future.result()
+                # On IPv6, ignore flow_info and scope_id
+                raddr, rport = conn.getpeername()[:2]
+                laddr, lport = conn.getsockname()[:2]
+                gen_log.info("connected %s: %s:%s from %s:%s",
+                             self._remote_address.addr[0], raddr, rport, laddr, lport)
 
-        try:
-            hostname, port = self._remote_address[1]
-            if self._opt.server:
-                exc = None
-                close_connection = True
-                af = self._remote_address[0]
-                try:
-                    conn = future.result()
+                response = socks5.create_response(
+                    socks5.REP_SUCCEEDED,
+                    RemoteAddress(conn.family, (laddr, lport)))
+                self._reply_socks5_request(response, self._streams.local)
+                self._create_remote_stream(conn)
+                self._stage = _Stage.STREAM
+                return
+            except ConnectionRefusedError as _:
+                exc = _
+                rep = socks5.REP_CONN_REFUSED
+            except (socket.timeout, TimeoutError) as _:
+                exc = _
+                rep = socks5.REP_TTL
+            except Exception as _:
+                exc = _
+                rep = socks5.REP_NETWORK_UNREACHABLE
 
-                    # On IPv6, ignore flow_info and scope_id
-                    raddr, rport = conn.getpeername()[:2]
-                    laddr, lport = conn.getsockname()[:2]
-                    gen_log.info("connected %s: %s:%s from %s:%s",
-                                 hostname, raddr, rport, laddr, lport)
-                    bnd_addr = socket.inet_pton(conn.family, laddr)
-                    bnd_port = struct.pack("!H", lport)
-                    if conn.family == socket.AF_INET:
-                        atyp = b'\x01'
-                    else:
-                        atyp = b'\x04'
-                    resp = bytearray(b'\x05\x00\x00')  # VER | REP |  RSV
-                    resp += atyp
-                    resp += bnd_addr
-                    resp += bnd_port
-
-                    self._create_remote_stream(conn)
-                    close_connection = False
-                except (socket.timeout, TimeoutError) as _:
-                    exc = _
-                    resp = bytearray(b'\x05\x06\x00')  # X'06' TTL expired
-                except Exception as _:
-                    exc = _
-                    resp = bytearray(b'\x05\x03\x00')  # X'03' Network unreachable
-
-                if not close_connection:
-                    nwrite = self._streams.local.write(resp)
-                    self._update_last_interaction(nwrite=nwrite)
-                else:
-                    if af == socket.AF_UNSPEC:
-                        resp += b'\x03'
-                        addr = hostname.encode("idna")
-                        resp += bytes([len(addr)])
-                    else:
-                        if af == socket.AF_INET:
-                            resp += b'\x01'
-                        else:
-                            resp += b'\x04'
-                        addr = socket.inet_pton(af, hostname)
-                    resp += addr
-                    resp += struct.pack("!H", port)
-                    gen_log.info("SOCK5 failed to connect '%s:%s' (%s)",
-                                 hostname, port, exc)
-                    nwrite = self._streams.local.write(resp)
-                    self._update_last_interaction(nwrite=nwrite)
-                    self.stop()
-            else:
-                try:
-                    conn = future.result()
-                    self._create_remote_stream(conn)
-                    # need to do the first relay
-                    self._relay(self._streams.local, self._streams.remote)
-                except Exception as exc:
-                    gen_log.error("failed to connect '%s:%s' (%s)",
-                                  hostname, port, exc)
-                    self.stop()
-        except Exception:
-            gen_log.error("Uncaught exception, closing connection.",
-                          exc_info=True)
+            gen_log.info("SOCK5 failed to connect %s (%s)",
+                         self._remote_address.addr, exc)
+            response = socks5.create_response(rep, self._remote_address)
+            self._reply_socks5_request(response, self._streams.local)
             self.stop()
+            return
+        else:
+            try:
+                conn = future.result()
+                self._create_remote_stream(conn)
+                self._stage = _Stage.CRYPTO
+                self._write_chiper_para(self._streams.remote)
+                # need to do the first relay
+                self._relay(self._streams.local, self._streams.remote, True)
+            except Exception as exc:
+                gen_log.error("failed to connect %s (%s)",
+                              self._remote_address.addr, exc)
+                self.stop()
             return
 
 

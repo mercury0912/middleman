@@ -149,6 +149,7 @@ class IOStream:
                  max_buffer_size=MAX_BUFFER_SIZE,
                  read_chunk_size=READ_CHUNK_SIZE,
                  max_write_buffer_size=MAX_BUFFER_SIZE,
+                 read_fixed=True,
                  handler=None):
         self.socket = socket
         self.socket.setblocking(False)
@@ -156,10 +157,15 @@ class IOStream:
         self.io_loop = ioloop.IOLoop.current()
         self._state = None
         self.max_buffer_size = max_buffer_size
-        self.read_chunk_size = read_chunk_size
-        self._read_chunk = memoryview(bytearray(self.read_chunk_size))
-        self.read_buffer = bytearray()
-        self.read_buffer_pos = 0
+        self._read_chunk_size = read_chunk_size
+        self._read_chunk = bytearray(self._read_chunk_size)
+        self._read_fixed = read_fixed
+        if read_fixed:
+            self.read_buffer = self._read_chunk
+        else:
+            self.read_buffer = bytearray()
+        self.read_buffer_first = 0
+        self.read_buffer_last = 0
         self.read_buffer_size = 0
         self.read_target_bytes = None
         self._total_read_done_index = 0
@@ -179,9 +185,18 @@ class IOStream:
             buf = None
 
     def handle_read(self):
+        if self._read_fixed:
+            if self.read_buffer_last == self._read_chunk_size:
+                gen_log.error("Reached maximum read buffer size %s",
+                              self._read_chunk_size)
+                raise StreamBufferFullError("Reached maximum read buffer size")
         while True:
             try:
-                bytes_read = self.read_from_fd(self._read_chunk)
+                if self._read_fixed and self.read_buffer_last != 0:
+                        bytes_read = self.read_from_fd(
+                            memoryview(self._read_chunk[self.read_buffer_last:]))
+                else:
+                    bytes_read = self.read_from_fd(self._read_chunk)
             except OSError as e:
                 if e.errno == errno.EINTR:
                     continue
@@ -207,28 +222,37 @@ class IOStream:
             self.FIN_received = True
             return 0
         self._total_read_done_index += bytes_read
-        self.read_buffer += self._read_chunk[:bytes_read]
+        self.read_buffer_last += bytes_read
         self.read_buffer_size += bytes_read
-        if self.read_buffer_size > self.max_buffer_size:
-            gen_log.error("Reached maximum read buffer size %s",
-                          self.max_buffer_size)
-            raise StreamBufferFullError("Reached maximum read buffer size")
+        if not self._read_fixed:
+            self.read_buffer += memoryview(self._read_chunk[:bytes_read])
+            if self.read_buffer_size > self.max_buffer_size:
+                gen_log.error("Reached maximum read buffer size %s",
+                              self.max_buffer_size)
+                raise StreamBufferFullError("Reached maximum read buffer size")
 
-        if (self.read_target_bytes is not None and
-                self.read_target_bytes > self.read_buffer_size):
-            return None
+        if self.read_target_bytes is not None:
+            if self.read_target_bytes > self.read_buffer_size:
+                return None
+            else:
+                self.read_target_bytes = None
         return bytes_read
 
     def consume(self, length):
         assert 0 <= length <= self.read_buffer_size
-        self.read_buffer_pos += length
+        self.read_buffer_first += length
         self.read_buffer_size -= length
-        # Amortized O(1) shrink
-        # (this heuristic is implemented natively in Python 3.4+
-        #  but is replicated here for Python 2)
-        if self.read_buffer_pos > self.read_buffer_size:
-            del self.read_buffer[:self.read_buffer_pos]
-            self.read_buffer_pos = 0
+        if self._read_fixed:
+            if self.read_buffer_first == self.read_buffer_last:
+                self.read_buffer_first = self.read_buffer_last = 0
+        else:
+            # Amortized O(1) shrink
+            # (this heuristic is implemented natively in Python 3.4+
+            #  but is replicated here for Python 2)
+            if self.read_buffer_first > self.read_buffer_size:
+                del self.read_buffer[:self.read_buffer_first]
+                self.read_buffer_first = 0
+                self.read_buffer_last = self.read_buffer_size
 
     def write_to_fd(self, data):
         try:
@@ -350,7 +374,6 @@ class IOStream:
                 self._state = None
             self.socket.close()
             self.socket = None
-            self._read_chunk.release()
             self._read_chunk= None
             self.read_buffer = None
             self._write_buffer = None

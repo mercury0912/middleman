@@ -67,6 +67,7 @@ setup(
         "Programming Language :: Python :: Implementation :: CPython",
     ],
     python_requires=">=3.4",
+    install_requires=['cryptography>=1.8'],
     zip_safe=False,
     entry_points={
         'console_scripts': ['middleman = middleman.server:main']
