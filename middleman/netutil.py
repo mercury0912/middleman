@@ -29,7 +29,8 @@ if hasattr(errno, "WSAEWOULDBLOCK"):
 # Default backlog used when calling sock.listen()
 _DEFAULT_BACKLOG = 128
 
-RemoteAddress = namedtuple('RemoteAddr', ['af', 'addr'])
+ProtocolAddress = namedtuple('ProtocolAddress', ['af', 'address', 'port'])
+
 
 def bind_sockets(port, address=None, family=socket.AF_UNSPEC,
                  backlog=_DEFAULT_BACKLOG, flags=None, reuse_port=False):

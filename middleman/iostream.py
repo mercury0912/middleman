@@ -376,5 +376,6 @@ class IOStream:
             self.socket = None
             self._read_chunk= None
             self.read_buffer = None
+            # self._write_buffer.release()
             self._write_buffer = None
             self._handler = None

@@ -3,6 +3,8 @@ import hashlib
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
 
+DK_LEN = 16
+
 
 class Secret:
     key_map = {}
@@ -44,6 +46,6 @@ class Secret:
         else:
             salt = b'middlemanamelddim'
             key = hashlib.pbkdf2_hmac('sha256', passwd.encode(),
-                                      salt, 100000, dklen=16)
+                                      salt, 100000, dklen=DK_LEN)
             cls.key_map[passwd] = key
             return key
