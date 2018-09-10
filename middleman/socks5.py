@@ -1,7 +1,7 @@
 import socket
 import struct
 
-from middleman.netutil import RemoteAddress
+from middleman.netutil import ProtocolAddress
 from middleman.log import gen_log
 
 VERSION = 5
@@ -132,7 +132,7 @@ class Socks5:
                                              self._buf[pos:pos+FIELD_IPV4_SIZE])
                 pos += FIELD_IPV4_SIZE
                 dest_port = struct.unpack('!H', self._buf[pos:pos+FIELD_PORT_SIZE])[0]
-                remote_address = RemoteAddress(socket.AF_INET, (dest_addr, dest_port))
+                remote_address = ProtocolAddress(socket.AF_INET, dest_addr, dest_port)
                 error = False
             elif atyp == 0x03:  # DOMAINNAME
                 if len(self._buf) < head_len + FIELD_DN_LEN_SIZE:
@@ -145,7 +145,7 @@ class Socks5:
                 dest_hostname = self._buf[pos:pos+host_len].decode('idna')
                 pos += host_len
                 dest_port = struct.unpack('!H', self._buf[pos:pos + FIELD_PORT_SIZE])[0]
-                remote_address = RemoteAddress(socket.AF_UNSPEC, (dest_hostname, dest_port))
+                remote_address = ProtocolAddress(socket.AF_UNSPEC, dest_hostname, dest_port)
                 error = False
             elif atyp == 0x04:
                 octets = head_len + FIELD_IPV6_SIZE + FIELD_PORT_SIZE
@@ -155,7 +155,7 @@ class Socks5:
                                              self._buf[pos:pos+FIELD_IPV6_SIZE])
                 pos += FIELD_IPV6_SIZE
                 dest_port = struct.unpack('!H', self._buf[pos:pos+FIELD_PORT_SIZE])[0]
-                remote_address = RemoteAddress(socket.AF_INET6, (dest_addr, dest_port))
+                remote_address = ProtocolAddress(socket.AF_INET6, dest_addr, dest_port)
                 error = False
             else:
                 gen_log.error("SOCKS5 unsupported address type: %s" % atyp)
@@ -178,7 +178,8 @@ class Socks5:
 
 def create_response(rep, remote):
     af = remote.af
-    addr, port = remote.addr
+    addr = remote.address
+    port = remote.port
     response = bytearray()
     response += VER
     response += rep
