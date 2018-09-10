@@ -92,9 +92,11 @@ class DaemonContext:
         self.pidlockedfile = None
 
         if uid is None:
-            self.uid = os.getuid()
+            uid = os.getuid()
+        self.uid = uid
         if gid is None:
-            self.gid = os.getuid()
+            gid = os.getuid()
+        self.gid = gid
         self.initgroups = initgroups
         if signal_map is None:
             self.signal_map = make_default_signal_map()
@@ -150,7 +152,6 @@ class DaemonContext:
         fd = self.pidlockedfile.fd if self.pidlockedfile is not None else -1
         signal_handler_map = self._make_signal_handler_map()
         set_signal_handlers(signal_handler_map)
-        close_all_open_files_exc_pid(fd)
         redirect_standard_stream()
         self._is_open = True
 
@@ -397,6 +398,7 @@ def close_all_open_files_exc_pid(fd):
 
 
 def redirect_standard_stream():
+    os.closerange(0, 3)
     fd0 = os.open(os.devnull, os.O_RDWR)
     fd1 = os.dup(0)
     fd2 = os.dup(0)
