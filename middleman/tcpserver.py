@@ -209,7 +209,8 @@ class _TcpRelayHandler:
                 else:
                     break
         else:
-            self.stop()
+            if not len(self._streams.local._write_buffer):
+                self.stop()
 
     def _handle_write(self, islocal):
         try:
@@ -223,6 +224,10 @@ class _TcpRelayHandler:
     def _on_local_write(self):
         count = self._streams.local.handle_write()
         self._update_last_interaction(nwrite=count)
+        if not len(self._streams.local._write_buffer):
+            if (self._streams.remote is not None and
+                    self._streams.remote.FIN_received):
+                self.stop()
 
     def _on_remote_write(self):
         count = self._streams.remote.handle_write()
