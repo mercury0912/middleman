@@ -34,6 +34,8 @@ def display_options_info(opts):
             continue
         if isserver and attr.startswith("remote"):
             continue
+        if attr == 'remote':
+            val = val[0]
         print("%-30s %s" % (attr, val))
     print('=' * 80)
     print(flush=True)
@@ -67,7 +69,7 @@ def set_abspath(opts, opt_files):
 def _parse_command_line():
     parser = argparse.ArgumentParser(
         description="I'm just a middleman.", add_help=False,
-        usage="%(prog)s passwd (-r remote|-s) [OPTION]...",
+        usage="%(prog)s --pass passwd (-r remote|-s) [OPTION]...",
         epilog="Online help: https://github.com/mercury0912/middleman")
     group_proxy = parser.add_argument_group('service-level options')
     group_proxy.add_argument(
@@ -86,13 +88,13 @@ def _parse_command_line():
                              default=300, metavar='timeout',
                              help='timeout in seconds for idle connections (default: %(default)ss)')
 
-    group_proxy.add_argument('passwd', metavar='passwd', help='specify passwd')
+    group_proxy.add_argument('--pass', dest='passwd', metavar='passwd',
+                             nargs=1, required=True, help='specify passwd')
 
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument('-s', dest='server', action='store_true',
                              help='run as the server (default: %(default)s)')
-    group.add_argument('-r', dest='remote',
-                             default=_LOCALHOST, metavar='remote',
+    group.add_argument('-r', dest='remote', nargs=1, metavar='remote',
                              help='server endpoint address')
 
     group_log = parser.add_argument_group('logging control')
