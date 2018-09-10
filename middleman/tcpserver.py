@@ -8,7 +8,7 @@ from middleman.encryption import Secret
 from middleman.ioloop import IOLoop, PeriodicCallback
 from middleman.util import fileobj_to_fd
 from middleman.log import gen_log
-from middleman.netutil import bind_sockets, add_accept_handler, RemoteAddress
+from middleman.netutil import bind_sockets, add_accept_handler, ProtocolAddress
 from middleman.iostream import IOStream, StreamConnresetError
 from middleman.sysplatform.auto import set_close_exec
 
@@ -23,6 +23,7 @@ class _Stage(enum.IntEnum):
 
 
 _SOCKET_TIMEOUT = 10
+_MAX_ATTEMPT_TIMES = 3
 
 
 class _TcpRelayHandler:
@@ -45,18 +46,20 @@ class _TcpRelayHandler:
                 self.remote.close()
                 self.remote = None
 
-    def __init__(self, server, local_socket, opt, ioloop=None):
+    def __init__(self, tcpserver, server, local_socket, opt, ioloop=None):
         self._server = server
+        self._tcpserver = tcpserver
         self._opt = opt
         self._io_loop = ioloop or IOLoop.current()
         self._streams = self._StreamPair(self._handle_events, local_socket)
         self._remote_address = None
+        self._dname = None
         self._stage = _Stage.INIT
         self._closed = False
         self._future = None
-        self._secret = Secret(opt.passwd)
+        self._secret = Secret(opt.passwd[0])
         # time of the last interaction, used for timeout
-        self._last_interaction = server.unixtime
+        self._last_interaction = time.time()
         self._cron = PeriodicCallback(self._timeout_cron,
                                       opt.timeout * 1000, 0.1)
 
@@ -79,13 +82,13 @@ class _TcpRelayHandler:
         else:
             self._stage = _Stage.CONNECTING
             # TODO: add support for AF_INET and AF_UNSPEC
-            self._remote_address = RemoteAddress(
-                socket.AF_INET, (self._opt.remote, self._opt.remote_port))
+            self._remote_address = ProtocolAddress(
+                socket.AF_INET, self._opt.remote[0], self._opt.remote_port)
             self._io_loop.run_in_exector(
                 None, self._remote_gotconnected,
                 self._create_connection,
                 self._remote_address.af,
-                self._remote_address.addr)
+                (self._remote_address.address, self._remote_address.port))
 
     def stop(self):
         if self._closed:
@@ -101,7 +104,8 @@ class _TcpRelayHandler:
         self._cron = None
 
         # remove handler from server
-        self._server.remove_handler(self._streams.local.socket)
+        self._tcpserver.remove_handler(self._streams.local.socket)
+
         # close connection
         self._streams.close()
         self._streams = None
@@ -287,14 +291,28 @@ class _TcpRelayHandler:
                 self._reply_socks5_request(resp, stream)
                 self._stage = _Stage.SOCK5_CMD
             else:
-                remote_address = self._socks5.evaluate_request(msg)
-                self._remote_address = remote_address
-                gen_log.info("connecting %s", self._remote_address.addr)
+                self._remote_address = self._socks5.evaluate_request(msg)
                 self._stage = _Stage.CONNECTING
                 del self._socks5
+                if self._remote_address.af == socket.AF_UNSPEC:
+                    self._dname = self._remote_address.address
+                    if self._dname in self._server.dc:
+                        ditem = self._server.dc[self._dname]
+                        rep, af, addr = ditem.value
+                        port = self._remote_address.port
+                        self._remote_address = ProtocolAddress(af, addr, port)
+                        if rep == socks5.REP_SUCCEEDED:
+                            gen_log.error("Hit cache: %s (%s)", self._dname, addr)
+                        elif ditem.times >= _MAX_ATTEMPT_TIMES:
+                            response = socks5.create_response(rep, self._remote_address)
+                            self._reply_socks5_request(response, self._streams.local)
+                            gen_log.error("failed to connect %s (Rep: %s)", self._dname, rep[0])
+                            raise socks5.Socks5Error
+
                 self._future = self._io_loop.run_in_exector(
                     None, self._remote_gotconnected, self._create_connection,
-                    self._remote_address.af, self._remote_address.addr,
+                    self._remote_address.af,
+                    (self._remote_address.address, self._remote_address.port),
                     _SOCKET_TIMEOUT)
         except socks5.Socks5SizeError:
             return
@@ -310,9 +328,9 @@ class _TcpRelayHandler:
 
     def _update_last_interaction(self, nread=0, nwrite=0):
         if nread > 0 or nwrite > 0:
-            self._last_interaction = self._server.unixtime
-            self._server.stat_net_input_bytes += nread
-            self._server.stat_net_output_bytes += nwrite
+            self._last_interaction = self._server.ct.unixtime
+            self._tcpserver.stat_net_input_bytes += nread
+            self._tcpserver.stat_net_output_bytes += nwrite
 
     @staticmethod
     def _create_connection(af, address, timeout=_SOCKET_TIMEOUT):
@@ -336,23 +354,29 @@ class _TcpRelayHandler:
         self._streams.remote.add_io_state(IOLoop.READ)
 
     def _remote_gotconnected(self, future):
-        if self.closed():
-            return
         if self._opt.server:
+            if self._dname is None and self.closed():
+                return
             try:
                 conn = future.result()
+                rep = socks5.REP_SUCCEEDED
                 # On IPv6, ignore flow_info and scope_id
                 raddr, rport = conn.getpeername()[:2]
+                af = conn.family
+                if self._dname is not None:
+                    gen_log.info("%s (%s)", self._dname, raddr)
+                    self._server.dc[self._dname] = (rep, af, raddr)
+                if self.closed():
+                    return
+                self._remote_address = ProtocolAddress(af, raddr, rport)
                 laddr, lport = conn.getsockname()[:2]
-                gen_log.info("connected %s: %s:%s from %s:%s",
-                             self._remote_address.addr[0], raddr, rport, laddr, lport)
-
-                response = socks5.create_response(
-                    socks5.REP_SUCCEEDED,
-                    RemoteAddress(conn.family, (laddr, lport)))
+                pa = ProtocolAddress(af, laddr, lport)
+                response = socks5.create_response(rep, pa)
                 self._reply_socks5_request(response, self._streams.local)
                 self._create_remote_stream(conn)
                 self._stage = _Stage.STREAM
+                gen_log.info("connected %s:%s from %s:%s",
+                             raddr, rport, laddr, lport)
                 return
             except ConnectionRefusedError as _:
                 exc = _
@@ -364,13 +388,21 @@ class _TcpRelayHandler:
                 exc = _
                 rep = socks5.REP_NETWORK_UNREACHABLE
 
-            gen_log.info("SOCK5 failed to connect %s (%s)",
-                         self._remote_address.addr, exc)
-            response = socks5.create_response(rep, self._remote_address)
+            af = self._remote_address.af
+            host = self._remote_address.address
+            port = self._remote_address.port
+            if self._dname is not None:
+                self._server.dc[self._dname] = (rep, af, host)
+            if self.closed():
+                return
+            gen_log.info("failed to connect '%s:%s' (%s)", host, port, exc)
+            pa = ProtocolAddress(af, host, port)
+            response = socks5.create_response(rep, pa)
             self._reply_socks5_request(response, self._streams.local)
             self.stop()
-            return
         else:
+            if self.closed():
+                return
             try:
                 conn = future.result()
                 self._create_remote_stream(conn)
@@ -379,14 +411,14 @@ class _TcpRelayHandler:
                 # need to do the first relay
                 self._relay(self._streams.local, self._streams.remote, True)
             except Exception as exc:
-                gen_log.error("failed to connect %s (%s)",
-                              self._remote_address.addr, exc)
+                gen_log.error("failed to connect %s:%s (%s)",
+                              self._remote_address.address,
+                              self._remote_address.port, exc)
                 self.stop()
-            return
 
 
 class TCPServer:
-    def __init__(self, opt):
+    def __init__(self, opt, server):
         self._io_loop = IOLoop.current()
         self._sockets = {}  # fd -> socket object
         self._handlers = {}  # fd -> remove_handler callable
@@ -395,10 +427,9 @@ class TCPServer:
         self._stopped = False
         self.stat_net_input_bytes = 0
         self.stat_net_output_bytes = 0
-        self.unixtime = time.time()
         self._opt = opt
-        self._cron = PeriodicCallback(self._server_cron, 1 * 1000)
         self._relay_num = 0
+        self._server = server
 
     def add_sockets(self, sockets):
         """Makes this server start accepting connections on the given sockets.
@@ -475,7 +506,6 @@ class TCPServer:
         sockets = self._pending_sockets
         self._pending_sockets = []
         self.add_sockets(sockets)
-        self._cron.start()
 
     def stop(self):
         """Stops listening for new connections.
@@ -486,9 +516,6 @@ class TCPServer:
         if self._stopped:
             return
         self._stopped = True
-        # stop timer
-        self._cron.stop()
-        self._cron = None
 
         for fd, sock in self._sockets.items():
             assert sock.fileno() == fd
@@ -501,12 +528,6 @@ class TCPServer:
             fd, handler = self._handlers.popitem()
             handler()
 
-    def _server_cron(self):
-        self._update_cached_time()
-
-    def _update_cached_time(self):
-        self.unixtime = time.time()
-
     def add_handler(self, connection, handler):
         self._handlers[connection.fileno()] = handler
         self._relay_num += 1
@@ -517,6 +538,6 @@ class TCPServer:
 
     def _handle_connection(self, connection, address):
         gen_log.info("Accepted client connection %s", address)
-        relay = _TcpRelayHandler(self, connection, self._opt, self._io_loop)
+        relay = _TcpRelayHandler(self, self._server, connection, self._opt, self._io_loop)
         self.add_handler(connection, relay.stop)
         relay.start()
