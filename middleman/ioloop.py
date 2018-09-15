@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from middleman import util
 from middleman.log import gen_log
+from middleman.process import cpu_count
 from middleman.sysplatform.auto import set_close_exec, Waker
 
 
@@ -64,6 +65,8 @@ class IOLoop:
         self._running = False
         self._closing = False
         self._thread_ident = None
+        self._executor = None
+
         # unique sequence count
         self._timeout_counter = itertools.count()
 
@@ -86,7 +89,7 @@ class IOLoop:
         self._impl.close()
         self._callbacks = None
         self._timeouts = None
-        if hasattr(self, '_executor'):
+        if self._executor is not None:
             self._executor.shutdown()
 
     @staticmethod
@@ -379,7 +382,7 @@ class IOLoop:
             func = functools.partial(self._add_done_callback, callback)
             future.add_done_callback(func)
 
-    def run_in_exector(self, executor, callback, func, *args):
+    def run_in_exector(self, callback, func, *args):
         """Runs a function in a ``concurrent.futures.Executor``. If
         ``executor`` is ``None``, the IO loop's default executor will be used.
 
@@ -390,19 +393,15 @@ class IOLoop:
         if ThreadPoolExecutor is None:
             raise RuntimeError(
                 "concurrent.futures is required to use IOLoop.run_in_executor")
-
-        if executor is None:
-            if not hasattr(self, '_executor'):
-                from middleman.process import cpu_count
-                # Changed in version 3.5: If max_workers is None or not given,
-                # it will default to the number of processors on the machine,
-                # multiplied by 5, assuming that ThreadPoolExecutor is often
-                # used to overlap I/O instead of CPU work and the number of
-                #  workers should be higher than the number of workers
-                # for ProcessPoolExecutor.
-                self._executor = ThreadPoolExecutor(max_workers=(cpu_count() * 5))
-            executor = self._executor
-        future = executor.submit(func, *args)
+        # Changed in version 3.5: If max_workers is None or not given,
+        # it will default to the number of processors on the machine,
+        # multiplied by 5, assuming that ThreadPoolExecutor is often
+        # used to overlap I/O instead of CPU work and the number of
+        #  workers should be higher than the number of workers
+        # for ProcessPoolExecutor.
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(max_workers=(cpu_count() * 5))
+        future = self._executor.submit(func, *args)
         self.add_future(future, callback)
         return future
 

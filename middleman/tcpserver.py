@@ -24,6 +24,19 @@ class _Stage(enum.IntEnum):
 
 _SOCKET_TIMEOUT = 10
 _MAX_ATTEMPT_TIMES = 3
+_MAGIC_NUMBER = b'\x02\x12'
+
+
+class TcpServerError(Exception):
+    pass
+
+
+class MagicNumberError(TcpServerError):
+    pass
+
+
+class SizeError(TcpServerError):
+    pass
 
 
 class _TcpRelayHandler:
@@ -61,32 +74,31 @@ class _TcpRelayHandler:
         # time of the last interaction, used for timeout
         self._last_interaction = time.time()
         self._cron = PeriodicCallback(self._timeout_cron,
-                                      opt.timeout * 1000, 0.1)
+                                      60 * 1000, 0.1)
 
     def _timeout_cron(self):
         if (not self.closed() and
                 time.time() - self._last_interaction > self._opt.timeout):
+            gen_log.info("close idle connection")
             self.stop()
-            gen_log.info("Closing idle connection")
 
     def closed(self):
         return self._closed
 
     def start(self):
         self._cron.start()
-        self._streams.local.add_io_state(IOLoop.READ)
+        self._update_stream_state(True)
         self._secret.set_encryptor(iv=os.urandom(16))
         if self._opt.server:
             self._stage = _Stage.CRYPTO
             self._socks5 = socks5.Socks5()
         else:
             self._stage = _Stage.CONNECTING
-            # TODO: add support for AF_INET and AF_UNSPEC
+            # TODO: add support for AF_INET6 and AF_UNSPEC
             self._remote_address = ProtocolAddress(
                 socket.AF_INET, self._opt.remote[0], self._opt.remote_port)
             self._io_loop.run_in_exector(
-                None, self._remote_gotconnected,
-                self._create_connection,
+                self._remote_gotconnected, self._create_connection,
                 self._remote_address.af,
                 (self._remote_address.address, self._remote_address.port))
 
@@ -103,7 +115,7 @@ class _TcpRelayHandler:
         self._cron.stop()
         self._cron = None
 
-        # remove handler from server
+        # remove handler from tcpserver
         self._tcpserver.remove_handler(self._streams.local.socket)
 
         # close connection
@@ -149,9 +161,14 @@ class _TcpRelayHandler:
 
     @staticmethod
     def _update_stream(stream):
-        state = IOLoop.READ
+        state = None
+        if not stream.FIN_received:
+            state = IOLoop.READ
         if stream.writing():
-            state |= IOLoop.WRITE
+            if state is not None:
+                state = state | IOLoop.WRITE
+            else:
+                state = IOLoop.WRITE
         stream.update_io_state(state)
 
     def _handle_read(self, islocal):
@@ -160,57 +177,63 @@ class _TcpRelayHandler:
                 self._on_local_read()
             else:
                 self._on_remote_read()
-        except (socks5.Socks5Error, StreamConnresetError):
+        except (socks5.Socks5Error, StreamConnresetError, TcpServerError):
             self.stop()
 
     def _on_local_read(self):
-        stream = self._streams.local
-        nread = stream.handle_read()
+        lstream = self._streams.local
+        rstream = self._streams.remote
+        nread = lstream.handle_read()
         if nread is None:
             return
         if nread:
             self._update_last_interaction(nread=nread)
-            while (stream.read_buffer_size and
-                   stream.read_target_bytes is None):
+            while (lstream.read_buffer_size and
+                   lstream.read_target_bytes is None):
                 if self._stage == _Stage.STREAM:
-                    self._relay(self._streams.local, self._streams.remote, True)
+                    self._relay(lstream, rstream, True)
                 elif (self._stage == _Stage.SOCKS5_METHOD or
                       self._stage == _Stage.SOCK5_CMD):
-                    self._handle_socks5(stream)
+                    self._handle_socks5(lstream)
                 elif self._stage == _Stage.CRYPTO:
                     if self._opt.server:
-                        if self._set_decipher(stream):
-                            self._write_chiper_para(stream)
+                        if self._set_decipher(lstream):
+                            self._write_chiper_para(lstream)
                             self._stage = _Stage.SOCKS5_METHOD
                     else:
-                        self._relay(self._streams.local, self._streams.remote, True)
+                        self._relay(lstream, rstream, True)
                 elif self._stage == _Stage.CONNECTING:
                     break
         else:
             self.stop()
 
     def _on_remote_read(self):
-        stream = self._streams.remote
-        nread = stream.handle_read()
+        rstream = self._streams.remote
+        lstream = self._streams.local
+        nread = rstream.handle_read()
         if nread is None:
             return
         if nread:
             self._update_last_interaction(nread=nread)
-            while (stream.read_buffer_size and
-                   stream.read_target_bytes is None):
+            while (rstream.read_buffer_size and
+                   rstream.read_target_bytes is None):
                 if self._stage == _Stage.STREAM:
-                    self._relay(self._streams.remote, self._streams.local, False)
+                    self._relay(rstream, lstream, False)
                 elif self._stage == _Stage.CRYPTO:
                     if not self._opt.server:
-                        if self._set_decipher(stream):
+                        if self._set_decipher(rstream):
                             self._stage = _Stage.STREAM
                     else:
-                        self._relay(self._streams.remote, self._streams.local, False)
+                        self._relay(rstream, lstream, False)
                 else:
                     break
         else:
-            if not len(self._streams.local._write_buffer):
+            if not len(lstream.write_buffer):
                 self.stop()
+            else:
+                rstream.update_io_state(None)
+                if len(rstream.write_buffer):
+                    rstream.write_buffer.clear()
 
     def _handle_write(self, islocal):
         try:
@@ -224,7 +247,7 @@ class _TcpRelayHandler:
     def _on_local_write(self):
         count = self._streams.local.handle_write()
         self._update_last_interaction(nwrite=count)
-        if not len(self._streams.local._write_buffer):
+        if not len(self._streams.local.write_buffer):
             if (self._streams.remote is not None and
                     self._streams.remote.FIN_received):
                 self.stop()
@@ -233,8 +256,13 @@ class _TcpRelayHandler:
         count = self._streams.remote.handle_write()
         self._update_last_interaction(nwrite=count)
 
+        if (self._streams.local.FIN_received and
+                not len(self._streams.remote.write_buffer)):
+            self._streams.remote.socket.shutdown(socket.SHUT_WR)
+
     def _write_chiper_para(self, stream):
-        para = bytearray([len(self._secret.eiv) + 1])
+        para = bytearray([len(self._secret.eiv) + 3])
+        para += _MAGIC_NUMBER
         para += self._secret.eiv
         n = stream.write(para)
         self._update_last_interaction(nwrite=n)
@@ -244,11 +272,17 @@ class _TcpRelayHandler:
         buf = stream.read_buffer
         buf_pos = stream.read_buffer_first
         length = buf[buf_pos]
+        if length != 19:
+            raise SizeError
         if stream.read_buffer_size < length:
             stream.read_target_bytes = length
             return None
         buf_pos += 1
-        iv = buf[buf_pos:buf_pos+length-1]
+        magic_num = buf[buf_pos:buf_pos+2]
+        if magic_num != _MAGIC_NUMBER:
+            raise MagicNumberError
+        buf_pos += 2
+        iv = buf[buf_pos:buf_pos+length-3]
         stream.consume(length)
         return iv
 
@@ -283,10 +317,10 @@ class _TcpRelayHandler:
             data = self._encrypt(src)
 
         nwrite = dest.write(data)
-        # update dest io state
+        self._update_last_interaction(nwrite=nwrite)
+        # update dest stream state
         self._update_stream(dest)
         dest.remove_event(IOLoop.WRITE)
-        self._update_last_interaction(nwrite=nwrite)
 
     def _handle_socks5(self, stream):
         msg = self._decrypt(stream)
@@ -307,7 +341,7 @@ class _TcpRelayHandler:
                         port = self._remote_address.port
                         self._remote_address = ProtocolAddress(af, addr, port)
                         if rep == socks5.REP_SUCCEEDED:
-                            gen_log.error("Hit cache: %s (%s)", self._dname, addr)
+                            gen_log.debug("Hit cache: %s (%s) current cache items: %s", self._dname, addr, len(self._server.dc))
                         elif ditem.times >= _MAX_ATTEMPT_TIMES:
                             response = socks5.create_response(rep, self._remote_address)
                             self._reply_socks5_request(response, self._streams.local)
@@ -315,7 +349,7 @@ class _TcpRelayHandler:
                             raise socks5.Socks5Error
 
                 self._future = self._io_loop.run_in_exector(
-                    None, self._remote_gotconnected, self._create_connection,
+                    self._remote_gotconnected, self._create_connection,
                     self._remote_address.af,
                     (self._remote_address.address, self._remote_address.port),
                     _SOCKET_TIMEOUT)
@@ -369,7 +403,6 @@ class _TcpRelayHandler:
                 raddr, rport = conn.getpeername()[:2]
                 af = conn.family
                 if self._dname is not None:
-                    gen_log.info("%s (%s)", self._dname, raddr)
                     self._server.dc[self._dname] = (rep, af, raddr)
                 if self.closed():
                     return
@@ -380,8 +413,12 @@ class _TcpRelayHandler:
                 self._reply_socks5_request(response, self._streams.local)
                 self._create_remote_stream(conn)
                 self._stage = _Stage.STREAM
-                gen_log.info("connected %s:%s from %s:%s",
-                             raddr, rport, laddr, lport)
+                if self._dname is not None:
+                    gen_log.debug("connected %s (%s:%s) from %s:%s",
+                                 self._dname, raddr, rport, laddr, lport)
+                else:
+                    gen_log.debug("connected %s:%s from %s:%s",
+                                 raddr, rport, laddr, lport)
                 return
             except ConnectionRefusedError as _:
                 exc = _
@@ -400,7 +437,8 @@ class _TcpRelayHandler:
                 self._server.dc[self._dname] = (rep, af, host)
             if self.closed():
                 return
-            gen_log.info("failed to connect '%s:%s' (%s)", host, port, exc)
+            gen_log.error("failed to connect '%s:%s' (%s)",
+                         host.encode("idna").decode(), port, exc)
             pa = ProtocolAddress(af, host, port)
             response = socks5.create_response(rep, pa)
             self._reply_socks5_request(response, self._streams.local)
@@ -413,8 +451,9 @@ class _TcpRelayHandler:
                 self._create_remote_stream(conn)
                 self._stage = _Stage.CRYPTO
                 self._write_chiper_para(self._streams.remote)
-                # need to do the first relay
-                self._relay(self._streams.local, self._streams.remote, True)
+                # maybe need to do the first relay
+                if self._streams.local.read_buffer_size:
+                    self._relay(self._streams.local, self._streams.remote, True)
             except Exception as exc:
                 gen_log.error("failed to connect %s:%s (%s)",
                               self._remote_address.address,
@@ -542,7 +581,7 @@ class TCPServer:
         self._relay_num -= 1
 
     def _handle_connection(self, connection, address):
-        gen_log.info("Accepted client connection %s", address)
+        gen_log.debug("Accepted client connection %s", address)
         relay = _TcpRelayHandler(self, self._server, connection, self._opt, self._io_loop)
         self.add_handler(connection, relay.stop)
         relay.start()

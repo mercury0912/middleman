@@ -140,9 +140,14 @@ class _StreamBuffer(object):
         assert size == 0
         self._first_pos = pos
 
+    def clear(self):
+        self._buffers.clear()
+        self._first_pos = 0
+        self._size = 0
+
 
 class IOStream:
-    READ_CHUNK_SIZE = 1024 * 32
+    READ_CHUNK_SIZE = 65536
     MAX_BUFFER_SIZE = 104857600
 
     def __init__(self, socket,
@@ -169,7 +174,7 @@ class IOStream:
         self.read_buffer_size = 0
         self.read_target_bytes = None
         self._total_read_done_index = 0
-        self._write_buffer = _StreamBuffer()
+        self.write_buffer = _StreamBuffer()
         self.max_write_buffer_size = max_write_buffer_size
         self._total_write_done_index = 0
         self.FIN_received = False
@@ -265,7 +270,7 @@ class IOStream:
     def handle_write(self):
         total_written = 0
         while True:
-            size = len(self._write_buffer)
+            size = len(self.write_buffer)
             if not size:
                 break
             try:
@@ -275,8 +280,8 @@ class IOStream:
                     # returning the number of bytes it was able to
                     # process.  Therefore we must not call socket.send
                     # with more than 128KB at a time.
-                    size = 128 * 1024
-                num_bytes = self.write_to_fd(self._write_buffer.peek(size))
+                    size = 131072  # 128 * 1024
+                num_bytes = self.write_to_fd(self.write_buffer.peek(size))
             except BlockingIOError:
                 break
             except OSError as e:
@@ -296,9 +301,11 @@ class IOStream:
             else:
                 if num_bytes == 0:
                     break
-                self._write_buffer.advance(num_bytes)
+                self.write_buffer.advance(num_bytes)
                 self._total_write_done_index += num_bytes
                 total_written += num_bytes
+                if total_written >= 131072:
+                    break
         return total_written
 
     def write(self, data):
@@ -306,18 +313,29 @@ class IOStream:
             raise StreamClosedError('Stream is closed')
         if data:
             if (self.max_write_buffer_size is not None and
-                    len(self._write_buffer) + len(data) > self.max_write_buffer_size):
+                    len(self.write_buffer) + len(data) > self.max_write_buffer_size):
                 raise StreamBufferFullError("Reached maximum write buffer size %s" %
                                             self.max_write_buffer_size)
-            self._write_buffer.append(data)
+            self.write_buffer.append(data)
         nwrite = self.handle_write()
-        if self._write_buffer:
+        if self.write_buffer:
             self.add_io_state(self.io_loop.WRITE)
         return nwrite
 
+    def writing_append(self, data):
+        if self._closed:
+            raise StreamClosedError('Stream is closed')
+        if data:
+            if (self.max_write_buffer_size is not None and
+                    len(self.write_buffer) + len(data) > self.max_write_buffer_size):
+                raise StreamBufferFullError("Reached maximum write buffer size %s" %
+                                            self.max_write_buffer_size)
+            self.write_buffer.append(data)
+            self.add_io_state(self.io_loop.WRITE)
+
     def writing(self):
         """Returns true if we are currently writing to the stream."""
-        return bool(self._write_buffer)
+        return bool(self.write_buffer)
 
     def connect(self, address, handler):
         self._connecting = True
@@ -353,11 +371,30 @@ class IOStream:
             self.io_loop.update_handler(self.socket, self._state,
                                         self._handler)
 
+    def del_io_state(self, state):
+        if self._closed or self._state is None:
+            return
+        if self._state & state:
+            self._state = self._state & ~state
+            if self._state:
+                self.io_loop.update_handler(self.socket, self._state,
+                                            self._handler)
+            else:
+                self.io_loop.remove_handler(self.socket)
+                self._state = None
+
     def update_io_state(self, state):
         if self._state != state:
+            if self._state is None:
+                self.io_loop.add_handler(self.socket, state,
+                                         self._handler)
+            else:
+                if state is not None:
+                    self.io_loop.update_handler(self.socket, state,
+                                                self._handler)
+                else:
+                    self.io_loop.remove_handler(self.socket)
             self._state = state
-            self.io_loop.update_handler(self.socket, self._state,
-                                        self._handler)
 
     def remove_event(self, mask):
         self.io_loop.remove_event(self.socket, mask)
@@ -369,13 +406,13 @@ class IOStream:
         if not self._closed:
             self._closed = True
             if self._state is not None:
+                self._state = None
                 self.io_loop.remove_handler(self.socket)
                 self.io_loop = None
-                self._state = None
+
             self.socket.close()
             self.socket = None
-            self._read_chunk= None
+            self._read_chunk = None
             self.read_buffer = None
-            # self._write_buffer.release()
-            self._write_buffer = None
+            self.write_buffer = None
             self._handler = None

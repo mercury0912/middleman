@@ -16,7 +16,7 @@ class DnsItem:
 
 @singleton
 class DnsCache(MutableMapping):
-    def __init__(self, expire=60):
+    def __init__(self, expire=90):
         self._expire = expire
         self._io_loop = IOLoop.current()
         self._cache = OrderedDict()
