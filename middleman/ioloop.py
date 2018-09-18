@@ -260,7 +260,7 @@ class IOLoop:
                             break
                     if (self._cancellations > 512 and
                             self._cancellations > (len(self._timeouts) >> 1)):
-                        # Clean upt the timeout queue when it gets large and
+                        # Clean up the timeout queue when it gets large and
                         # it's more than half queue length
                         self._cancellations = 0
                         self._timeouts = [x for x in self._timeouts
@@ -497,6 +497,7 @@ class PeriodicCallback:
     def _run(self):
         if not self._running:
             return
+        self._timeout = None
         try:
             return self.callback()
         except Exception:
