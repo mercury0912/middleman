@@ -9,7 +9,7 @@ from middleman.ioloop import IOLoop, PeriodicCallback
 from middleman.util import fileobj_to_fd
 from middleman.log import gen_log
 from middleman.netutil import bind_sockets, add_accept_handler, ProtocolAddress
-from middleman.iostream import IOStream, StreamConnresetError
+from middleman.iostream import IOStream, StreamConnresetError, StreamBufferFullError
 from middleman.sysplatform.auto import set_close_exec
 
 
@@ -177,7 +177,7 @@ class _TcpRelayHandler:
                 self._on_local_read()
             else:
                 self._on_remote_read()
-        except (socks5.Socks5Error, StreamConnresetError, TcpServerError):
+        except (socks5.Socks5Error, StreamConnresetError, TcpServerError, StreamBufferFullError):
             self.stop()
 
     def _on_local_read(self):

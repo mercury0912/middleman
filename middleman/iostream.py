@@ -314,6 +314,8 @@ class IOStream:
         if data:
             if (self.max_write_buffer_size is not None and
                     len(self.write_buffer) + len(data) > self.max_write_buffer_size):
+                gen_log.error("Reached maximum write buffer size %s" %
+                              self.max_write_buffer_size)
                 raise StreamBufferFullError("Reached maximum write buffer size %s" %
                                             self.max_write_buffer_size)
             self.write_buffer.append(data)
@@ -328,6 +330,8 @@ class IOStream:
         if data:
             if (self.max_write_buffer_size is not None and
                     len(self.write_buffer) + len(data) > self.max_write_buffer_size):
+                gen_log.error("Reached maximum write buffer size %s" %
+                              self.max_write_buffer_size)
                 raise StreamBufferFullError("Reached maximum write buffer size %s" %
                                             self.max_write_buffer_size)
             self.write_buffer.append(data)
