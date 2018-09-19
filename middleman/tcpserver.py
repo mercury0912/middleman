@@ -341,11 +341,13 @@ class _TcpRelayHandler:
                         port = self._remote_address.port
                         self._remote_address = ProtocolAddress(af, addr, port)
                         if rep == socks5.REP_SUCCEEDED:
-                            gen_log.debug("Hit cache: %s (%s) current cache items: %s", self._dname, addr, len(self._server.dc))
+                            gen_log.debug("Hit cache: %s (%s) current cache items: %s",
+                                          self._dname, addr, len(self._server.dc))
                         elif ditem.times >= _MAX_ATTEMPT_TIMES:
                             response = socks5.create_response(rep, self._remote_address)
                             self._reply_socks5_request(response, self._streams.local)
-                            gen_log.error("failed to connect %s (Rep: %s)", self._dname, rep[0])
+                            gen_log.error("failed to connect %s (Rep: %s)",
+                                          self._dname, rep[0])
                             raise socks5.Socks5Error
 
                 self._future = self._io_loop.run_in_exector(
@@ -415,10 +417,10 @@ class _TcpRelayHandler:
                 self._stage = _Stage.STREAM
                 if self._dname is not None:
                     gen_log.debug("connected %s (%s:%s) from %s:%s",
-                                 self._dname, raddr, rport, laddr, lport)
+                                  self._dname, raddr, rport, laddr, lport)
                 else:
                     gen_log.debug("connected %s:%s from %s:%s",
-                                 raddr, rport, laddr, lport)
+                                  raddr, rport, laddr, lport)
                 return
             except ConnectionRefusedError as _:
                 exc = _
@@ -438,7 +440,7 @@ class _TcpRelayHandler:
             if self.closed():
                 return
             gen_log.error("failed to connect '%s:%s' (%s)",
-                         host.encode("idna").decode(), port, exc)
+                          host.encode("idna").decode(), port, exc)
             pa = ProtocolAddress(af, host, port)
             response = socks5.create_response(rep, pa)
             self._reply_socks5_request(response, self._streams.local)
