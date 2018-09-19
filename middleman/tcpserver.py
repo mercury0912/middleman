@@ -297,7 +297,7 @@ class _TcpRelayHandler:
     @staticmethod
     def _get_stream_readbuff_data(stream):
         readbuf = stream.read_buffer
-        data = memoryview(readbuf[stream.read_buffer_first:stream.read_buffer_last])
+        data = memoryview(readbuf)[stream.read_buffer_first:stream.read_buffer_last]
         stream.consume(len(data))
         return data
 

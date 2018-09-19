@@ -199,7 +199,7 @@ class IOStream:
             try:
                 if self._read_fixed and self.read_buffer_last != 0:
                         bytes_read = self.read_from_fd(
-                            memoryview(self._read_chunk[self.read_buffer_last:]))
+                            memoryview(self._read_chunk)[self.read_buffer_last:])
                 else:
                     bytes_read = self.read_from_fd(self._read_chunk)
             except OSError as e:
@@ -230,7 +230,7 @@ class IOStream:
         self.read_buffer_last += bytes_read
         self.read_buffer_size += bytes_read
         if not self._read_fixed:
-            self.read_buffer += memoryview(self._read_chunk[:bytes_read])
+            self.read_buffer += memoryview(self._read_chunk)[:bytes_read]
             if self.read_buffer_size > self.max_buffer_size:
                 gen_log.error("Reached maximum read buffer size %s",
                               self.max_buffer_size)
